@@ -1,5 +1,5 @@
 /*================================================================================================= 
-    Antenna Tracker - "Community Edition" (Dual-Protocol Auto-Detect)
+    Antenna Tracker - "Community Edition" (Dual-Protocol Auto-Detect + MP Relay)
 =================================================================================================*/
 
 #include <Arduino.h>
@@ -30,19 +30,19 @@
 // =======================================================================================
 
 // --- Telemetry (Drone) Data ---
-volatile float droneLat = 0;
-volatile float droneLon = 0;
+volatile double droneLat = 0;
+volatile double droneLon = 0;
 volatile float droneAlt = 0;
 volatile int droneSats = 0;
 volatile bool linkConnected = false;
 unsigned long lastPacketTime = 0;
 int currentChannel = 1;
 bool channelLocked = false;
-bool usingMavlink = false;
+bool usingWiFi = false;
 
 // --- Ground Station (Box) Data ---
-float boxLat = 0;
-float boxLon = 0;
+double boxLat = 0;
+double boxLon = 0;
 float boxAlt = 0;
 bool boxGPSFixed = false;
 int boxSats = 0;
@@ -81,7 +81,7 @@ uint32_t millisLED = 0;
 #endif
 
 // --- Geographic Structures ---
-struct Location { float lat; float lon; float alt; float hdg; float alt_ag; };
+struct Location { double lat; double lon; float alt; float hdg; float alt_ag; };
 struct Location hom = { 0,0,0,0,0};   
 struct Location cur = { 0,0,0,0,0};   
 struct Vector { float az; float el; int32_t dist; };
@@ -187,32 +187,26 @@ void WakeServos() {
 }
 
 // =======================================================================================
-// ESP-NOW TELEMETRY RECEIVER (CRSF Fallback)
+// TELEMETRY PARSERS (Universal CRSF & MAVLink)
 // =======================================================================================
-void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int data_len) {
+
+// --- 1. Universal CRSF Parser ---
+void parseCRSF(const uint8_t *data, int data_len) {
   int offset = -1;
-  for (int i = 4; i < 15; i++) {
-      if (data[i] == CRSF_FRAMETYPE_GPS && data_len >= i + 16) { 
+  for (int i = 0; i < 15; i++) {
+      if (i < data_len && data[i] == CRSF_FRAMETYPE_GPS && data_len >= i + 16) { 
           offset = i;
           break; 
       }
   }
 
   if (offset != -1) {
-    lastPacketTime = millis();
-    linkConnected = true;
-    
-    if (!channelLocked) {
-      channelLocked = true;
-      Serial.println("ELRS LINK OK - LOCKED ON PACKET!");
-    }
-
     long latitudeBytes = 0; long longitudeBytes = 0;
     for (int i = 0; i < 4; ++i) latitudeBytes |= (data[(offset + 4) - i] << (i * 8));
     for (int i = 0; i < 4; ++i) longitudeBytes |= (data[(offset + 8) - i] << (i * 8));
 
-    droneLat = latitudeBytes / 10000000.0;
-    droneLon = longitudeBytes / 10000000.0;
+    droneLat = (double)latitudeBytes / 10000000.0;
+    droneLon = (double)longitudeBytes / 10000000.0;
     
     uint16_t altitudeRaw = (data[offset + 13] << 8) | data[offset + 14];
     int altitude1 = altitudeRaw - 1000;
@@ -221,9 +215,18 @@ void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int data_
   }
 }
 
-// =======================================================================================
-// MAVLINK UDP RECEIVER (Primary WiFi Mode)
-// =======================================================================================
+// --- 2. ESP-NOW Receiver (CRSF Fallback) ---
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int data_len) {
+    lastPacketTime = millis();
+    linkConnected = true;
+    if (!channelLocked) {
+      channelLocked = true;
+      Serial.println("ESP-NOW LINK OK!");
+    }
+    parseCRSF(data, data_len);
+}
+
+// --- 3. MAVLink V2 Byte Parser ---
 void parseMavlink(uint8_t c) {
     static uint8_t state = 0;
     static uint8_t payloadLen = 0;
@@ -231,7 +234,6 @@ void parseMavlink(uint8_t c) {
     static uint8_t payload[30];
     static uint8_t payloadIdx = 0;
 
-    // Lightweight V2 State Machine for Msg 33 (GLOBAL_POSITION_INT)
     switch (state) {
         case 0: if (c == 0xFD) state = 1; break; // V2 Magic
         case 1: payloadLen = c; state = 2; break; // Length
@@ -240,17 +242,27 @@ void parseMavlink(uint8_t c) {
         case 8: if (c == 0) state = 9; else state = 0; break; // MsgId byte 2
         case 9: if (c == 0 && msgId == 33) { payloadIdx = 0; state = 10; } else state = 0; break; // MsgId byte 3
         case 10:
-            if (payloadIdx < 30) payload[payloadIdx++] = c;
-            if (payloadIdx == 28) { // Msg 33 payload size
-                int32_t latRaw = (payload[7] << 24) | (payload[6] << 16) | (payload[5] << 8) | payload[4];
-                int32_t lonRaw = (payload[11] << 24) | (payload[10] << 16) | (payload[9] << 8) | payload[8];
-                int32_t altRaw = (payload[15] << 24) | (payload[14] << 16) | (payload[13] << 8) | payload[12]; // mm
+            if (payloadIdx < payloadLen && payloadIdx < 30) {
+                payload[payloadIdx++] = c;
+            }
+            if (payloadIdx == payloadLen) { 
+                // As long as we have at least 16 bytes, we have time, lat, lon, and alt.
+                if (payloadLen >= 16) {
+                    // Safely cast to uint32_t before shifting to prevent negative coordinate overflow
+                    uint32_t rawLat = ((uint32_t)payload[7] << 24) | ((uint32_t)payload[6] << 16) | ((uint32_t)payload[5] << 8) | (uint32_t)payload[4];
+                    uint32_t rawLon = ((uint32_t)payload[11] << 24) | ((uint32_t)payload[10] << 16) | ((uint32_t)payload[9] << 8) | (uint32_t)payload[8];
+                    uint32_t rawAlt = ((uint32_t)payload[15] << 24) | ((uint32_t)payload[14] << 16) | ((uint32_t)payload[13] << 8) | (uint32_t)payload[12]; // mm
 
-                if (latRaw != 0 && lonRaw != 0) { 
-                    droneLat = latRaw / 10000000.0;
-                    droneLon = lonRaw / 10000000.0;
-                    droneAlt = altRaw / 1000.0;
-                    droneSats = 15; // Spoof healthy satellite count since Msg33 relies on ArduPilot fix
+                    int32_t latInt = (int32_t)rawLat;
+                    int32_t lonInt = (int32_t)rawLon;
+                    int32_t altInt = (int32_t)rawAlt;
+
+                    if (latInt != 0 && lonInt != 0) { 
+                        droneLat = (double)latInt / 10000000.0;
+                        droneLon = (double)lonInt / 10000000.0;
+                        droneAlt = altInt / 1000.0;
+                        droneSats = 15; // Spoof healthy satellite count
+                    }
                 }
                 state = 0;
             }
@@ -258,6 +270,7 @@ void parseMavlink(uint8_t c) {
     }
 }
 
+// --- 4. WiFi UDP Router (Passive Relay Listener) ---
 void readUDP() {
     int packetSize = udp.parsePacket();
     if (packetSize) {
@@ -265,10 +278,18 @@ void readUDP() {
         linkConnected = true;
         if (!channelLocked) {
             channelLocked = true;
-            Serial.println("MAVLINK UDP LINK OK!");
+            Serial.println("WIFI UDP LINK OK!");
         }
-        while (udp.available()) {
-            parseMavlink(udp.read());
+        
+        uint8_t buffer[512];
+        int len = udp.read(buffer, sizeof(buffer));
+        
+        if (len > 0) {
+            if (buffer[0] == 0xFD) {
+                for (int i = 0; i < len; i++) parseMavlink(buffer[i]);
+            } else {
+                parseCRSF(buffer, len);
+            }
         }
     }
 }
@@ -280,8 +301,8 @@ void ReadLocalGPS() {
   if (myGNSS.getGnssFixOk()) {
       boxGPSFixed = true;
       boxSats = myGNSS.getSIV();
-      boxLat = myGNSS.getLatitude() / 10000000.0;
-      boxLon = myGNSS.getLongitude() / 10000000.0;
+      boxLat = (double)myGNSS.getLatitude() / 10000000.0;
+      boxLon = (double)myGNSS.getLongitude() / 10000000.0;
       
       if (!calibrationDone) {
           boxAlt = myGNSS.getAltitude() / 1000.0; 
@@ -319,7 +340,12 @@ void ReadCompass() {
             if (trackerHeading < 0) trackerHeading += 360.0;
 
             trackerHeading = 360.0 - trackerHeading; 
+            
+            // Add Meridian, Idaho Magnetic Declination
+            trackerHeading += 13.5;
+            
             if (trackerHeading >= 360.0) trackerHeading -= 360.0;
+            if (trackerHeading < 0) trackerHeading += 360.0;
         }
     }
 #endif
@@ -405,8 +431,8 @@ void PerformCalibration() {
     preferences.begin("anttrack", false);
     preferences.putFloat("offset", (float)panOffset);
     preferences.putFloat("altOffset", (float)altOffset); 
-    preferences.putFloat("lat", hom.lat);
-    preferences.putFloat("lon", hom.lon);
+    preferences.putDouble("lat", hom.lat);
+    preferences.putDouble("lon", hom.lon);
     preferences.putUInt("epoch", currentEpoch); 
     preferences.end();
     
@@ -418,8 +444,8 @@ void CheckFailsafe() {
     if (!boxGPSFixed) return; 
 
     preferences.begin("anttrack", true);
-    float savedLat = preferences.getFloat("lat", 0);
-    float savedLon = preferences.getFloat("lon", 0);
+    double savedLat = preferences.getDouble("lat", 0);
+    double savedLon = preferences.getDouble("lon", 0);
     float savedOffset = preferences.getFloat("offset", 0);
     uint32_t savedEpoch = preferences.getUInt("epoch", 0);
     preferences.end();
@@ -506,16 +532,17 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 6000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 12000) {
       delay(100);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-      usingMavlink = true;
+      usingWiFi = true;
       udp.begin(UDP_PORT);
-      LogScreenPrintln("MAVLink Lock", "UDP: 14550");
+      String ipStr = WiFi.localIP().toString();
+      LogScreenPrintln("WiFi UDP Lock", ipStr);
   } else {
-      usingMavlink = false;
+      usingWiFi = false;
       WiFi.disconnect();
       esp_wifi_set_mac(WIFI_IF_STA, BINDING_MAC);
       if (esp_now_init() != ESP_OK) ESP.restart();
@@ -548,10 +575,15 @@ void loop() {
   ReadCompass();
   ReadLocalGPS();
 
-  if (usingMavlink) {
+  if (usingWiFi) {
       readUDP();
+      // Drop connection if packets stop for 2 seconds on WiFi
+      if (millis() - lastPacketTime > 2000) {
+          channelLocked = false; 
+          linkConnected = false; 
+      }
   } else {
-      // Channel hopping only active during ESP-NOW
+      // Channel hopping and drop connection on ESP-NOW
       if (millis() - lastPacketTime > 2000) {
         channelLocked = false; linkConnected = false; 
         currentChannel++; if (currentChannel > 13) currentChannel = 1;
@@ -604,10 +636,25 @@ void loop() {
           if (tiltAngle < 0) tiltAngle = 0;
           if (tiltAngle > maxEl) tiltAngle = maxEl; 
           
-          pointServos((uint16_t)finalAzLong, tiltAngle);
+          // Zenith Deadband: Freeze Pan axis just before hitting mechanical tilt limit
+          static uint16_t lastValidAz = finalAzLong;
+          if (tiltAngle > 65) {
+              pointServos(lastValidAz, tiltAngle);
+          } else {
+              lastValidAz = finalAzLong;
+              pointServos((uint16_t)finalAzLong, tiltAngle);
+          }
       }
   } 
-  
+  // --- LINK LOST (MID-FLIGHT) ---
+  else if (homeEstablished && calibrationDone && !linkConnected) {
+     static unsigned long warnTimer = 0;
+     if (millis() - warnTimer > 1000) {
+        warnTimer = millis();
+        if (usingWiFi) LogScreenPrintln("LINK LOST", WiFi.localIP().toString());
+        else LogScreenPrintln("LINK LOST", "ESP-NOW");
+     }
+  }
   // --- PRE-FLIGHT / WAITING MODE ---
   else if (!homeEstablished || boxSats < MIN_SATS) {
      static unsigned long warnTimer = 0;
@@ -621,7 +668,11 @@ void loop() {
      static unsigned long warnTimer = 0;
      if (millis() - warnTimer > 1000) { 
         warnTimer = millis();
-        if (!linkConnected) LogScreenPrintln("No Link");
+        if (!linkConnected) {
+            // Show exact IP address while waiting for connection
+            if (usingWiFi) LogScreenPrintln("No Link", WiFi.localIP().toString());
+            else LogScreenPrintln("No Link", "ESP-NOW");
+        }
         else if (droneSats < MIN_SATS) LogScreenPrintln("Drone: " + String(droneSats) + "/" + String(MIN_SATS)); 
         else LogScreenPrintln("Ready", "Hold 1 sec");
      }
@@ -635,29 +686,29 @@ void loop() {
 // =======================================================================================
 
 float getDist(struct Location &a, struct Location &b) {
-  float dLon = (b.lon - a.lon) * PI / 180.0;
-  float lat1 = a.lat * PI / 180.0;
-  float lat2 = b.lat * PI / 180.0;
-  float dLat = (b.lat - a.lat) * PI / 180.0;
-  float x = sin(dLat/2) * sin(dLat/2) + sin(dLon/2) * sin(dLon/2) * cos(lat1) * cos(lat2);
-  float c = 2 * atan2(sqrt(x), sqrt(1-x));
+  double dLon = (b.lon - a.lon) * PI / 180.0;
+  double lat1 = a.lat * PI / 180.0;
+  double lat2 = b.lat * PI / 180.0;
+  double dLat = (b.lat - a.lat) * PI / 180.0;
+  double x = sin(dLat/2) * sin(dLat/2) + sin(dLon/2) * sin(dLon/2) * cos(lat1) * cos(lat2);
+  double c = 2 * atan2(sqrt(x), sqrt(1-x));
   return 6371000.0 * c; 
 }
 
 void getAzEl(struct Location &hom, struct Location &cur) {
-  float dLon = (cur.lon - hom.lon) * PI / 180.0;
-  float lat1 = hom.lat * PI / 180.0;
-  float lat2 = cur.lat * PI / 180.0;
+  double dLon = (cur.lon - hom.lon) * PI / 180.0;
+  double lat1 = hom.lat * PI / 180.0;
+  double lat2 = cur.lat * PI / 180.0;
 
-  float y = sin(dLon) * cos(lat2);
-  float x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
-  float az = atan2(y, x) * 180.0 / PI;
+  double y = sin(dLon) * cos(lat2);
+  double x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+  double az = atan2(y, x) * 180.0 / PI;
   if (az < 0) az += 360;
   hc_vector.az = az;
 
-  float dLat = (cur.lat - hom.lat) * PI / 180.0;
-  float a = sin(dLat/2) * sin(dLat/2) + sin(dLon/2) * sin(dLon/2) * cos(lat1) * cos(lat2);
-  float c = 2 * atan2(sqrt(a), sqrt(1-a));
+  double dLat = (cur.lat - hom.lat) * PI / 180.0;
+  double a = sin(dLat/2) * sin(dLat/2) + sin(dLon/2) * sin(dLon/2) * cos(lat1) * cos(lat2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
   hc_vector.dist = 6371000 * c; 
 
   float rawDiff = cur.alt - hom.alt;
