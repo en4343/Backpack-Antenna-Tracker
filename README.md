@@ -30,7 +30,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 | Component | Recommendation & Notes |
 | :--- | :--- |
 | **Microcontroller** | [ESP32 Dev Board](https://www.amazon.com/dp/B08D5ZD528) (Standard 30 or 38-pin module). |
-| **Servos** | [2x DS3218 20kg 270° Servos](https://www.amazon.com/dp/B08MTQ1QD1). *Must* be the 270-degree version for proper pan rotation. |
+| **Servos** | [2x DS3218 20kg 270° Servos](https://www.amazon.com/dp/B08MTQ1QD1). I have tested and used 270-degree servos. 180 may/should work but untested. |
 | **Display** | [ELEGOO 0.96" OLED](https://www.amazon.com/dp/B0D2RMQQHR). Must be 4-Pin I2C and use the **SSD1306** chip (avoid SH1106). |
 | **Ground GPS** | Any standard UBlox FPV GPS module (e.g., BN-220, Walksnail M10, Matek M10). |
 | **Power (BEC)** | [Castle Creations 10A BEC](https://www.readymaderc.com/products/details/castle-creations-bec-switching-regulator-10-amp-peak). **Crucial:** Never power servos from the ESP32's 5V pin. Use a dedicated 5V BEC (3A-5A continuous minimum) wired to the servos, sharing a common ground with the ESP32. |
@@ -41,6 +41,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 | **Resistors** | [2x 1kΩ - 4.7kΩ Resistors](https://www.digikey.com/short/29dhzrrp). Wire as pull-down resistors (between the servo signal wire and ground) to prevent violent startup twitches. |
 | *(Optional)* **Compass** | [Adafruit BNO085 9-DOF IMU](https://www.amazon.com/dp/B0CDGZMLPP). Selected because it does not require the "figure-8" calibration standard drone compasses need. |
 | *(Optional)* **Trim Knob** | [10k Linear Potentiometer](https://www.amazon.com/dp/B082FCRQS2). |
+| ** 3S Battery | ** Wired to BEC for power input. Doesn't have to be 3S but recommended so BEC doesn't have to step down voltage down to 5v too much. You may be able to get away with a 2S battery but not sure.
 
 🖨️ **3D Model Files:** Print the custom pan/tilt mechanics and electronics housing here: [MakerWorld: CRSF Antenna Tracker] *(Link)*
 
