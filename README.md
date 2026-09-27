@@ -1,7 +1,7 @@
-# 📡 CRSF-Tracker 
-A high-performance, open-source Antenna Tracker designed specifically for modern Long-Range FPV.
+# 📡 Antenna Tracker - Community Edition (CRSF & MAVLink)
+A high-performance, open-source Antenna Tracker designed specifically for modern Long-Range FPV. 
 
-This tracker natively sniffs your CRSF/ExpressLRS telemetry directly out of the air using the ESP32's low-latency ESP-NOW protocol. It grabs the GPS coordinates your flight controller is already broadcasting and points your high-gain patch antennas dead-center at your aircraft.
+No coding required! This tracker features a standalone Web UI for configuration and natively sniffs your telemetry directly out of the air. It grabs the GPS coordinates your flight controller is already broadcasting and points your high-gain patch antennas dead-center at your aircraft.
 
 ### ⚠️ Critical Prerequisite: Your Transmitter 
 Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. The backpack is a secondary ESP32 or ESP8285 chip inside your radio/module dedicated to communicating with ground station gear.
@@ -11,7 +11,8 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 ---
 
 ## ✨ Key Features
-* **100% Wireless Data Link:** Reads native CRSF telemetry packets over ESP-NOW. No extra hardware required on the drone/plane.
+* **100% Wireless Data Link:** Reads native CRSF telemetry packets over ESP-NOW, or MAVLink data via Wi-Fi UDP. No extra hardware required on the drone/plane.
+* **Standalone Web UI:** Configure your network, servo limits, and hardware toggles directly from your phone. No Arduino IDE or C++ editing required.
 * **The "Gatekeeper" Safety:** Refuses to calibrate until both the ground station and the aircraft have a rock-solid 8+ satellite 3D lock.
 * **Dual Calibration Modes:** Supports an optional BNO085 hardware compass for instant setup, or a "Visual Calibration Mode" for budget builds.
 * **Auto-Expiring NVRAM Failsafe:** Survives mid-flight power losses by instantly restoring your calibration math.
@@ -20,6 +21,11 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 ---
 
 ## 🛒 Hardware Shopping List
+
+> **⚠️ MICROCONTROLLER REQUIREMENT:**
+> You MUST use a standard **ESP32 WROOM-32 Dev Board** (either the 30-pin or 38-pin version). 
+> * **DO NOT** buy an ESP32-S2, ESP32-S3, ESP32-C3, or ESP8266. 
+> * The pre-compiled `.bin` firmware and the 3D-printed case are specifically designed around the standard WROOM-32 pinout. If you buy an "S3" or "C3" board, the pins will not match, the firmware will crash, and it will not fit in the case.
 
 | Component | Recommendation & Notes |
 | :--- | :--- |
@@ -42,31 +48,39 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 
 ## 🚀 Setup & Configuration
 
-### Step 1: Software & Libraries
-Use the **Arduino IDE** (tested with ESP32 Board Package v3.3.x). Install these libraries via the Library Manager:
-* `ESP32Servo` by Kevin Harrington
-* `SparkFun u-blox GNSS v3` by SparkFun
-* `Adafruit BNO08x`, `Adafruit SSD1306`, and `Adafruit GFX Library` by Adafruit
+### Step 1: Flash the Firmware
+You do not need to install the Arduino IDE or edit any code!
+1. Go to the [Espressif Web Flasher](https://espressif.github.io/esptool-js/).
+2. Connect your ESP32 via USB and click **Connect**. *(Tip: Block the 5V pin on your USB cable with tape to prevent the board from trying to pull servo power from your PC).*
+3. Select the `CRSF_Tracker.merged.bin` file from the releases page.
+4. **CRITICAL:** Ensure the Flash Address is set to `0x0`.
+5. Click **Program**.
 
-### Step 2: Find your ELRS Binding MAC Address
-Because this tracker sniffs raw ESP-NOW packets, it must impersonate your specific transmitter by converting your ELRS Binding Phrase into a 6-digit UID array.
+### Step 2: Find your ELRS Binding MAC Address (CRSF Users)
+Because this tracker sniffs raw packets directly out of the air, it must impersonate your specific transmitter by converting your ELRS Binding Phrase into a 6-digit UID array.
 1. Go to the [ExpressLRS UID Generator](https://www.expresslrs.org/hardware/spi-receivers/#binding-phrase-via-cli).
 2. Type your secret Binding Phrase into the box.
-3. Copy the UID bytes output (e.g., `252, 223, 149, 33, 43, 223`).
-4. Open `config.h` and paste those numbers into the `BINDING_MAC` array.
+3. Copy the UID bytes output (e.g., `252, 223, 149, 33, 43, 223`). Keep this handy for the next step.
 
-### Step 3: Configure Your Hardware Settings
-Open `config.h` and configure your specific build:
-1. **Find Servo Centers:** Plug your servos into a tester, physically center your pan/tilt mechanisms, and note the exact microsecond values (e.g., 1480 for Pan, 1550 for Tilt). Enter these into `PAN_CENTER_PWM` and `TILT_HORIZON_PWM`.
-2. **Toggles:** Set `#define USE_COMPASS` and `#define USE_TRIM_KNOB` to `false` if you didn't install those physical components.
+### Step 3: The Web Configuration Portal
+On its very first boot, the tracker will realize it has no saved settings and will automatically enter **Config Mode**. 
+1. Open your phone or laptop's Wi-Fi settings and look for a new network called **`Tracker_Config`**.
+2. Connect using the password: **`anttracker`**
+3. Open a web browser and navigate to `192.168.4.1`.
+4. Fill out the web form:
+   * **Telemetry Mode:** Choose ESP-NOW (CRSF) for a fast-booting direct link, or WiFi (MAVLink) to relay through Mission Planner. The form will dynamically hide inputs you don't need!
+   * **Servo Tuning:** Enter your exact servo PWM centers and limits. 
+   * **Hardware Toggles:** Tell the code if you installed the optional BNO085 compass or physical Trim Knob.
+5. Click **Save & Reboot**. The ESP32 will save your settings permanently.
+
+*(Note: If you ever change hardware or want to update your limits, simply hold down the physical Home/Reset button while powering on the tracker to force it back into Config Mode!)*
 
 ### Step 4: Radio & Flight Controller Setup
-1. **Radio:** Ensure your TX Backpack is flashed with your binding phrase. In your model setup, turn **Telemetry ON**. Run the ELRS Lua Script and ensure the Backpack is enabled.
-2. **ArduPilot Users (Crucial Fix):** If you use ArduPilot, you **must disable CRSF Passthrough** (Bit 8 / Value 256 in `RC_OPTIONS`). Passthrough bundles telemetry into a custom format the tracker cannot read. Disabling it restores the standard CRSF GPS packets the tracker needs.
-
-### Step 5: Flash the ESP32
-Connect your ESP32 via USB. Select **ESP32 Dev Module** in the boards menu, select your COM port, and upload. 
-*(Tip: Block the 5V pin on your USB cable with tape to prevent the board from trying to pull servo power from your PC).*
+1. **CRSF Users:** Ensure your TX Backpack is flashed with your binding phrase. In your model setup, turn **Telemetry ON**. Run the ELRS Lua Script and ensure the Backpack is enabled.
+2. **ArduPilot Users (Crucial Fix):** If you use ArduPilot and are using ESP-NOW/CRSF, you **must disable CRSF Passthrough** (Bit 8 / Value 256 in `RC_OPTIONS`). Passthrough bundles telemetry into a custom format the tracker cannot read. Disabling it restores the standard CRSF GPS packets the tracker needs.
+3. **MAVLink / Wi-Fi Users (Read Carefully!):** First, follow the official [ExpressLRS MAVLink documentation](https://www.expresslrs.org/software/mavlink/) to set up your backpack correctly. 
+   * ⚠️ **WARNING:** Do *not* try to manually turn on "Backpack Wi-Fi" from your radio's ELRS Lua script when trying to fly. Doing this forces the backpack into firmware-update mode and instantly breaks the telemetry relay. 
+   * **Testing Tip:** Before trying to connect the antenna tracker, connect your laptop to your backpack's Wi-Fi network and open Mission Planner. If you can get UDP telemetry on your laptop, the tracker will work flawlessly. 
 
 ---
 
@@ -101,11 +115,11 @@ Instead: Calibrate the tracker pointing toward the *center* of your intended fli
 <details>
 <summary><b>📺 Troubleshooting: OLED Screen is Black</b></summary>
 
-If the code flashed successfully but the screen is dead, your OLED likely uses an alternate I2C address. Open `CRSF_Tracker.ino`, find `if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))`, change `0x3C` to `0x3D`, and re-upload.
+If the firmware flashed successfully but the screen is dead, your OLED likely uses an alternate I2C address. To fix this, you must compile from source: open `main.cpp`, find `if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))`, change `0x3C` to `0x3D`, and re-upload via the Arduino IDE.
 </details>
 
 <details>
 <summary><b>🎛️ Live RF Trim Knob</b></summary>
 
-If installed, turning the potentiometer sweeps the entire tracker array up to 20° left or right mid-flight. This lets you manually dial in the invisible RF lobe of your patch antennas for the absolute best video feed without having to land and recalibrate.
+If installed and enabled in the Web UI, turning the physical potentiometer sweeps the entire tracker array up to 20° left or right mid-flight. This lets you manually dial in the invisible RF lobe of your patch antennas for the absolute best video feed without having to land and recalibrate.
 </details>
