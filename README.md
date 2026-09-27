@@ -40,7 +40,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 | **Resistors** | [2x 1kΩ - 4.7kΩ Resistors](https://www.digikey.com/short/29dhzrrp). Wire as pull-down resistors (between the servo signal wire and ground) to prevent violent startup twitches. |
 | *(Optional)* **Compass** | [Adafruit BNO085 9-DOF IMU](https://www.amazon.com/dp/B0CDGZMLPP). Selected because it does not require the "figure-8" calibration standard drone compasses need. |
 | *(Optional)* **Trim Knob** | [10k Linear Potentiometer](https://www.amazon.com/dp/B082FCRQS2). |
-| 3S LiPo/Li-Ion Battery | Wired to BEC for power input. Doesn't have to be 3S but recommended so BEC doesn't have to step down voltage down to 5v too much. You may be able to get away with a 2S battery but not sure. |
+| 3S LiPo/Li-Ion Battery | Wired to BEC for power input. Doesn't have to be 3S but recommended no higher than 3S so BEC doesn't have to step down voltage down to 5v too much. You may be able to get away with a 2S battery but not sure. |
 
 🖨️ **3D Model Files:** Print the custom pan/tilt mechanics and electronics housing here: [MakerWorld: CRSF Antenna Tracker] *https://makerworld.com/en/models/2561665-crsf-and-mavlink-antenna-tracker?from=search#profileId-2822572*
 
