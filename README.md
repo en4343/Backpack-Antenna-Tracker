@@ -101,7 +101,7 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 
 Every time you calibrate, the tracker saves its Home location, servo math, and a live GPS timestamp. If your tracker loses power mid-flight and reboots, it rapidly checks this memory. 
 
-If the tracker is still within 100m of its saved home, it bypasses the normal calibration requirements, restores the math, and immediately resumes tracking. This memory automatically expires after 3 hours. **To manually clear the memory** (e.g., moving to a new spot within 3 hours), hold the calibrate button for 5 seconds until the screen reads "RELEASE TO CLEAR".
+If the tracker is still within 100m of its saved home, it bypasses the normal calibration requirements, restores the math, and immediately resumes tracking. This memory automatically expires after 3 hours. **To manually clear the memory** (e.g., moving to a new spot within 3 hours), hold the calibrate button for 5 to 10 seconds until the screen reads "RELEASE TO CLEAR".
 </details>
 
 <details>
