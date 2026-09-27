@@ -14,7 +14,6 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 * **100% Wireless Data Link:** Reads native CRSF telemetry packets over ESP-NOW, or MAVLink data via Wi-Fi UDP. No extra hardware required on the drone/plane.
 * **Standalone Web UI:** Configure your network, servo limits, and hardware toggles directly from your phone. No Arduino IDE or C++ editing required.
 * **The "Gatekeeper" Safety:** Refuses to calibrate until both the ground station and the aircraft have a rock-solid 8+ satellite 3D lock.
-* **Dual Calibration Modes:** Supports an optional BNO085 hardware compass for instant setup, or a "Visual Calibration Mode" for budget builds.
 * **Auto-Expiring NVRAM Failsafe:** Survives mid-flight power losses by instantly restoring your calibration math.
 * **Live RF Trim (Optional):** Supports a physical potentiometer knob to micro-adjust your pan tracking mid-flight for maximum video clarity.
 
