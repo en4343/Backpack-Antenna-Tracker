@@ -40,9 +40,30 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 | **Resistors** | [2x 1kΩ - 4.7kΩ Resistors](https://www.digikey.com/short/29dhzrrp). Wire as pull-down resistors (between the servo signal wire and ground) to prevent violent startup twitches. |
 | *(Optional)* **Compass** | [Adafruit BNO085 9-DOF IMU](https://www.amazon.com/dp/B0CDGZMLPP). Selected because it does not require the "figure-8" calibration standard drone compasses need. |
 | *(Optional)* **Trim Knob** | [10k Linear Potentiometer](https://www.amazon.com/dp/B082FCRQS2). |
-| 3S LiPo/Li-Ion Battery | Wired to BEC for power input. Doesn't have to be 3S but recommended no higher than 3S so BEC doesn't have to step down voltage down to 5v too much. You may be able to get away with a 2S battery but not sure. |
+| **Battery** | **3S LiPo/Li-Ion Battery.** Wired to BEC for power input. Doesn't have to be 3S but recommended no higher than 3S so BEC doesn't have to step down voltage to 5v too much. You may be able to get away with a 2S battery but not sure. |
 
-🖨️ **3D Model Files:** Print the custom pan/tilt mechanics and electronics housing here: [MakerWorld: CRSF Antenna Tracker] *https://makerworld.com/en/models/2561665-crsf-and-mavlink-antenna-tracker?from=search#profileId-2822572*
+🖨️ **3D Model Files:** Print the custom pan/tilt mechanics and electronics housing here: [MakerWorld: CRSF Antenna Tracker](https://makerworld.com/en/models/2561665-crsf-and-mavlink-antenna-tracker?from=search#profileId-2822572)
+
+---
+
+## 🔌 Wiring & Pinout Guide
+
+> ⚡ **CRITICAL POWER DISTRIBUTION WARNING:**
+> Do **NOT** power the Pan and Tilt servos directly from the ESP32's 5V/VIN pin. FPV patch antennas are heavy, and moving them will instantly overdraw the ESP32, causing brown-outs, reboots, and burnt voltage regulators. 
+> * Wire your battery to the input of your 5V BEC.
+> * Connect the 5V BEC output to a Wago Lever Nut, and run wires to the Servos and the ESP32 `VIN` / `5V` pin.
+> * **All grounds must be shared.** Connect the ESP32 GND, BEC GND, GPS GND, and Servo GNDs together.
+
+| Component | ESP32 WROOM-32 Pin | Wiring Notes |
+| :--- | :--- | :--- |
+| **Pan Servo** | `GPIO 14` | Signal wire only. Add a 1k-4.7k pull-down resistor to GND to stop startup twitches. |
+| **Tilt Servo** | `GPIO 13` | Signal wire only. Add a 1k-4.7k pull-down resistor to GND to stop startup twitches. |
+| **UBlox GPS** | `RX2: 18`, `TX2: 19` | ESP32 `18` goes to GPS `TX`. ESP32 `19` goes to GPS `RX`. |
+| **OLED Display** | `SDA: 21`, `SCL: 22` | Powered via ESP32 3.3V or 5V (check your specific screen). |
+| **Calibrate/Home Button** | `GPIO 4` | Connect between `GPIO 4` and `GND`. No resistor needed (uses internal pull-up). |
+| **Status LED** | `GPIO 25` | Connect to LED positive. LED negative goes to `GND` via a small (220Ω - 1kΩ) resistor. |
+| **BNO085 Compass** *(Opt)* | `SDA: 21`, `SCL: 22`, `INT: 27`, `RST: 26` | Shares the `21`/`22` I2C bus with the OLED screen. |
+| **Trim Potentiometer** *(Opt)*| `GPIO 35` | Middle wiper pin connects to `GPIO 35`. Outer pins connect to `3.3V` and `GND`. |
 
 ---
 
