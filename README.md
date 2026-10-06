@@ -11,7 +11,8 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 ---
 
 ## ✨ Key Features
-* **100% Wireless Data Link:** Reads native CRSF telemetry packets over ESP-NOW, or MAVLink data via Wi-Fi UDP. No extra hardware required on the drone/plane.
+* **100% Wireless Data Link:** Reads native CRSF telemetry over ESP-NOW or Wi-Fi UDP (Backpack 1.5.7+), or MAVLink (v1 or v2) over Wi-Fi UDP. No extra hardware required on the drone/plane.
+* **Checksummed Telemetry:** Every CRSF and MAVLink position packet is CRC-checked before it is used, so a corrupted packet can never yank the antennas to a bogus position.
 * **Standalone Web UI:** Configure your network, servo limits, and hardware toggles directly from your phone. No Arduino IDE or C++ editing required.
 * **The "Gatekeeper" Safety:** Refuses to calibrate until both the ground station and the aircraft have a rock-solid 8+ satellite 3D lock.
 * **Auto-Expiring NVRAM Failsafe:** Survives mid-flight power losses by instantly restoring your calibration math.
@@ -73,7 +74,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 You do not need to install the Arduino IDE or edit any code!
 1. Go to the [Espressif Web Flasher](https://espressif.github.io/esptool-js/).
 2. Connect your ESP32 via USB and click **Connect**. *(Tip: Block the 5V pin on your USB cable with tape to prevent the board from trying to pull servo power from your PC).*
-3. Select the `CRSF_Tracker.merged.bin` file from the releases page.
+3. Select the `CRSF_Tracker.ino.merged.bin` file from the releases page.
 4. **CRITICAL:** Ensure the Flash Address is set to `0x0`.
 5. Click **Program**.
 
@@ -82,6 +83,8 @@ Because this tracker sniffs raw packets directly out of the air, it must imperso
 1. Go to the [ExpressLRS UID Generator](https://www.expresslrs.org/hardware/spi-receivers/#binding-phrase-via-cli).
 2. Type your secret Binding Phrase into the box.
 3. Copy the UID bytes output (e.g., `252, 223, 149, 33, 43, 223`). Keep this handy for the next step.
+   * Enter all six numbers exactly as shown, even if the first one is odd. The backpack clears the lowest bit of the first byte before using it as a MAC address, and the tracker now does the same automatically.
+   * The binding phrase must be the same one flashed into your **TX backpack**. If the backpack was flashed with a different phrase than your TX module, use the backpack's.
 
 ### Step 3: The Web Configuration Portal
 On its very first boot, the tracker will realize it has no saved settings and will automatically enter **Config Mode**. 
@@ -89,29 +92,49 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 2. Connect using the password: **`anttracker`**
 3. Open a web browser and navigate to `192.168.4.1`.
 4. Fill out the web form:
-   * **Telemetry Mode:** Choose ESP-NOW (CRSF) for a fast-booting direct link, or WiFi (MAVLink) to relay through Mission Planner. The form will dynamically hide inputs you don't need!
-   * **Servo Tuning:** Enter your exact servo PWM centers and limits. 
+   * **Telemetry Mode:** Choose ESP-NOW (CRSF) for a fast-booting direct link, WiFi UDP to receive telemetry over your backpack's WiFi (MAVLink, or CRSF with Backpack 1.5.7+, detected automatically), or **Auto-Detect**, which tries the WiFi network for 12 seconds at boot and falls back to ESP-NOW if it can't connect. The form will dynamically hide inputs you don't need!
+   * **Servo Tuning:** Enter your exact servo PWM centers and limits (use the servo tester to find them):
+     * **Pan Center / Min / Max:** Min and Max are the PWM values at the two ends of the servo's full travel; together with *Total Servo Travel* they set the degrees-per-microsecond scale.
+     * **Tilt Horizon PWM:** antennas perfectly level (0°).
+     * **Tilt Up PWM (90°):** antennas pointing straight up. This sets the tilt scale, so measure it rather than guessing. If straight-up is a *higher* number than horizon, that's fine, the tilt simply runs in reverse.
+     * **Tilt Down Limit PWM:** the physical limit on the below-horizon side. The servo is never driven past Up or Down.
    * **Hardware Toggles:** Tell the code if you installed the optional BNO085 compass or physical Trim Knob.
 5. Click **Save & Reboot**. The ESP32 will save your settings permanently.
 
-*(Note: If you ever change hardware or want to update your limits, simply hold down the physical Home/Reset button while powering on the tracker to force it back into Config Mode!)*
+*(Note: If you ever change hardware or want to update your limits, hold down the physical Home/Reset button while powering on the tracker and keep holding for about 2 seconds to force it back into Config Mode!)*
 
 ### Step 4: Radio & Flight Controller Setup
-1. **CRSF Users:** Ensure your TX Backpack is flashed with your binding phrase. In your model setup, turn **Telemetry ON**. Run the ELRS Lua Script and ensure the Backpack is enabled.
+1. **CRSF Users:** Ensure your TX Backpack is flashed with your binding phrase. In your model setup, turn **Telemetry ON**. Run the ELRS Lua Script and ensure the Backpack is enabled. Then pick how the backpack sends telemetry (ELRS Lua → **Backpack** → **Telemetry**):
+   * **ESPNOW:** set the tracker to *ESP-NOW / CRSF Only*. No WiFi setup needed.
+   * **WiFi** (Backpack firmware **1.5.7 or newer**): the backpack broadcasts the same CRSF telemetry over WiFi UDP. Set the tracker to *WiFi UDP Only* (or Auto-Detect), enter the backpack's WiFi network (its own AP is `ExpressLRS TX Backpack XXXXXX`, password `expresslrs`, unless you set home/hotspot credentials when flashing) and port `14550`. In this mode the backpack does **not** send ESP-NOW, so the tracker must be on WiFi.
 2. **ArduPilot Users (Crucial Fix):** If you use ArduPilot and are using ESP-NOW/CRSF, you **must disable CRSF Passthrough** (Bit 8 / Value 256 in `RC_OPTIONS`). Passthrough bundles telemetry into a custom format the tracker cannot read. Disabling it restores the standard CRSF GPS packets the tracker needs.
 3. **MAVLink / Wi-Fi Users (Read Carefully!):** First, follow the official [ExpressLRS MAVLink documentation](https://www.expresslrs.org/software/mavlink/) to set up your backpack correctly. 
    * ⚠️ **WARNING:** Do *not* try to manually turn on "Backpack Wi-Fi" from your radio's ELRS Lua script when trying to fly. Doing this forces the backpack into firmware-update mode and instantly breaks the telemetry relay. 
    * **Testing Tip:** Before trying to connect the antenna tracker, connect your laptop to your backpack's Wi-Fi network and open Mission Planner. If you can get UDP telemetry on your laptop, the tracker will work flawlessly. 
+   * **What the tracker reads:** `GLOBAL_POSITION_INT` (position) and `GPS_RAW_INT` (fix type and satellite count). Both are in ArduPilot's default telemetry streams. If your flight controller doesn't send `GPS_RAW_INT`, the tracker still works but can't check the aircraft's satellite count (the screen will show 15 as a placeholder).
 
 ---
 
 ## 🎯 Daily Flight Operations
 
 1. **Boot Sequence:** Power up the ground station. The tracker waits for its local GPS to hit 8 satellites. Power up your aircraft; the tracker LED will blink until it receives the drone's telemetry confirming it also has 8 satellites.
-2. **Calibration (Required before every flight):**
-   * **With Compass:** Face the tripod toward your flight area. When the screen says "Ready," hold the calibrate button for 1 second.
-   * **Without Compass:** Walk your powered aircraft 20-30m directly in front of the tracker. Physically rotate the tripod so the antennas point dead-center at the plane, then hold the calibrate button for 1 second.
-3. **Flight:** The servos lock dead-center until the aircraft flies beyond the `MIN_TRACKING_DIST` (default 2 meters), at which point smooth tracking begins.
+2. **Calibration (Required before every flight):** Walk your powered aircraft 20-30m directly in front of the tracker and set it **on the ground**. Physically rotate the tripod so the antennas point dead-center at the plane. When the screen says "Ready," hold the calibrate button for 1 second.
+   * Calibration records "the tracker is pointing straight at the aircraft right now" and "the aircraft is at ground level right now", so both the direction and the ground placement matter. This is the same with or without the compass.
+   * **What the compass adds:** if the tripod gets bumped or rotated *after* calibration, the BNO085 detects the rotation and the tracker corrects for it automatically. Without a compass, a bumped tripod means recalibrating.
+   * If the compass is enabled but failed to start (screen showed "Compass FAIL" at boot), calibration automatically falls back to visual mode.
+3. **Flight:** The servos hold their position until the aircraft is more than `MIN_TRACKING_DIST` (default 5 meters) away or `MIN_TRACKING_ALT` (default 5 meters) above the calibration point. Then smooth tracking begins. (Closer than ~5m, normal GPS wander makes the bearing to the aircraft jump around.)
+   * **Blind spot:** the pan axis can't spin all the way around. With a 270° servo, the 90° behind the tracker is out of reach; if the aircraft crosses through it, the pan swings across to the other side. Point the tracker at the center of your flying area to keep the aircraft out of that zone.
+
+---
+
+### 🔘 Button Quick Reference
+
+| Action | When | Result |
+| :--- | :--- | :--- |
+| **Hold ~2 sec while powering on** | At power-on | Enter Config Mode (Wi-Fi `Tracker_Config`, `192.168.4.1`) |
+| **Tap 5 times quickly** | Any time, even while booting | Clear the saved failsafe calibration ("FAILSAFE CLEARED") |
+| **Hold 1–5 sec, then release** | Screen says "Ready" | Calibrate |
+| **Hold 5+ sec, then release** | After boot | Clear the saved failsafe calibration ("RELEASE TO CLEAR") |
 
 ---
 
@@ -122,7 +145,9 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 
 Every time you calibrate, the tracker saves its Home location, servo math, and a live GPS timestamp. If your tracker loses power mid-flight and reboots, it rapidly checks this memory. 
 
-If the tracker is still within 100m of its saved home, it bypasses the normal calibration requirements, restores the math, and immediately resumes tracking. This memory automatically expires after 3 hours. **To manually clear the memory** (e.g., moving to a new spot within 3 hours), hold the calibrate button for 5 to 10 seconds until the screen reads "RELEASE TO CLEAR".
+If the tracker is still within 100m of its saved home, it bypasses the normal calibration requirements, restores the math (pan direction and altitude reference), and resumes tracking as soon as the aircraft is more than 5m away. This memory automatically expires after 3 hours. **To manually clear the memory** (e.g., moving to a new spot within 3 hours, or you just swapped the tracker battery and don't want the servos snapping to the old position):
+* **Tap the calibrate button 5 times quickly** (taps under ~0.5s each, less than 1.5s apart). This works at any time, **including while the tracker is still booting**, so the old calibration is wiped before it can be restored. The screen shows "FAILSAFE CLEARED".
+* Or hold the calibrate button for 5 to 10 seconds until the screen reads "RELEASE TO CLEAR".
 </details>
 
 <details>
@@ -136,8 +161,46 @@ Instead: Calibrate the tracker pointing toward the *center* of your intended fli
 <details>
 <summary><b>📺 Troubleshooting: OLED Screen is Black</b></summary>
 
-If the firmware flashed successfully but the screen is dead, your OLED likely uses an alternate I2C address. To fix this, you must compile from source: open `main.cpp`, find `if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))`, change `0x3C` to `0x3D`, and re-upload via the Arduino IDE.
+If the firmware flashed successfully but the screen is dead, your OLED likely uses an alternate I2C address. To fix this, you must compile from source (see below): open `CRSF_Tracker/CRSF_Tracker.ino`, find `if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))`, change `0x3C` to `0x3D`, and re-upload via the Arduino IDE.
 </details>
+
+<details>
+<summary><b>📡 Troubleshooting: "No Link" (ESP-NOW / CRSF)</b></summary>
+
+* Check the six UID numbers in the Web UI against the UID generated from your **backpack's** binding phrase.
+* Make sure the TX backpack is enabled in the ELRS Lua script and that model telemetry is ON.
+* "No Link" while the drone is powered usually means the backpack isn't sending. A drone count stuck at 0 while the link is OK means telemetry is arriving but there's no GPS frame in it (check the GPS on the aircraft, and for ArduPilot see the CRSF passthrough note in Step 4).
+* If the screen shows **"MAC FAIL"** at boot, the UID entered in the Web UI is invalid. Re-enter it.
+</details>
+
+<details>
+<summary><b>📶 Troubleshooting: "No Link" (WiFi / MAVLink)</b></summary>
+
+* "WiFi Disconnected" means the tracker can't join the backpack's network: check the SSID/password. In WiFi-only mode the tracker keeps retrying in the background, so you can power the radio on after the tracker.
+* If WiFi connects (the screen shows an IP address) but there's still no link, check the UDP port (usually 14550) and confirm Mission Planner on a laptop receives telemetry from the same backpack.
+</details>
+
+<details>
+<summary><b>🐢 Tuning: Servo Smoothness</b></summary>
+
+`SERVO_SPEED` (top of the sketch, default `0.3`) controls how quickly the servos chase the target every 20ms. Lower values (e.g. `0.1`) give smoother, slower motion, which is easier on the gears with heavy patch antennas. Higher values are snappier.
+</details>
+
+---
+
+## 🛠️ Building from Source
+
+Only needed if you want to change the code (e.g., the OLED address or `SERVO_SPEED`).
+
+1. Install **Arduino IDE 2.x**.
+2. In **Boards Manager**, install **esp32 by Espressif Systems**, version 3.x (tested with 3.3.12). Version 2.x will **not** compile, because the ESP-NOW receive callback changed.
+3. In **Library Manager**, install:
+   * `ESP32Servo` (Kevin Harrington / madhephaestus)
+   * `Adafruit BNO08x` (pulls in Adafruit BusIO and Adafruit Unified Sensor)
+   * `Adafruit SSD1306` and `Adafruit GFX Library`
+   * `SparkFun u-blox GNSS Arduino Library` (the **v2** library, not "v3")
+4. Open `CRSF_Tracker/CRSF_Tracker.ino`, select board **DOIT ESP32 DEVKIT V1**, and upload.
+5. To make a web-flashable file, use **Sketch → Export Compiled Binary**. The `build/.../CRSF_Tracker.ino.merged.bin` it creates is the file to flash at address `0x0`.
 
 <details>
 <summary><b>🎛️ Live RF Trim Knob</b></summary>
