@@ -3,6 +3,8 @@ A high-performance, open-source Antenna Tracker designed specifically for modern
 
 No coding required! This tracker features a standalone Web UI for configuration and natively sniffs your telemetry directly out of the air. It grabs the GPS coordinates your flight controller is already broadcasting and points your high-gain patch antennas dead-center at your aircraft.
 
+⚠️**This is an independent community project and is not affiliated with or endorsed by the ExpressLRS project. "ExpressLRS" and "ELRS" are used only to describe compatibility.**
+
 ### ⚠️ Critical Prerequisite: Your Transmitter 
 Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. The backpack is a secondary ESP32 or ESP8285 chip inside your radio/module dedicated to communicating with ground station gear.
 * **Supported:** Most modern external modules (Radiomaster Ranger, Happymodel ES24TX, BetaFPV Micro) and internal modules (Radiomaster Boxer, TX16S MKII, GX12).
