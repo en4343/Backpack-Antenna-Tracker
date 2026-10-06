@@ -1,5 +1,23 @@
-/*================================================================================================= 
+/*=================================================================================================
     Antenna Tracker - "Community Edition" (Standalone Web UI / Dynamic Link Toggles / Help Text)
+
+    Built with: Arduino-ESP32 core 3.x (tested 3.3.12), board "DOIT ESP32 DEVKIT V1"
+    Libraries:  ESP32Servo, Adafruit BNO08x, Adafruit GFX, Adafruit SSD1306,
+                SparkFun u-blox GNSS Arduino Library (v2.x)
+
+    Changes in this revision:
+      - ESP-NOW: clear the multicast bit of UID byte 0 like the ELRS backpack does (odd first
+        UID byte previously failed silently)
+      - CRSF: GPS frame located by length/type and verified with CRC8
+      - MAVLink: v1 + v2, CRC checked, can't lock up, real sat count from GPS_RAW_INT
+      - WiFi mode also accepts CRSF telemetry over UDP (ELRS Backpack 1.5.7+ "WiFi" telemetry)
+      - 5 quick taps on the button clears the saved failsafe calibration, even during boot
+      - Config mode now needs the button held for 1.5s at power-on (stray taps won't enter it)
+      - GPS: UBX-only + autoPVT so the main loop no longer blocks on every GPS read
+      - Tilt now uses the web UI PWM settings instead of hard-coded 1000-1600us
+      - Power-bump failsafe also restores the altitude reference
+      - WiFi-only mode keeps retrying after a boot timeout instead of dead-ending
+      - Tracking gate uses calibrated altitude; minimum tracking distance 2m -> 5m
 =================================================================================================*/
 
 #include <Arduino.h>
@@ -37,15 +55,22 @@
 #define TRIM_POT_PIN 35    // Analog Trim Knob
 
 #define MIN_SATS 8
-#define FAILSAFE_TIMEOUT 180 
-#define MIN_TRACKING_DIST 2  
-#define MIN_TRACKING_ALT 2   
-#define SERVO_SPEED 0.3      
-#define MAX_TRIM_ANGLE 20    
+#define FAILSAFE_TIMEOUT 180   // Minutes the saved calibration stays valid after a power loss
+#define MIN_TRACKING_DIST 5    // Meters. GPS noise is ~2-3m, so bearings closer than this are mostly noise
+#define MIN_TRACKING_ALT 5     // Meters above the calibrated ground level
+#define SERVO_SPEED 0.3        // Smoothing factor per 20ms step (lower = smoother/slower, e.g. 0.1)
+#define MAX_TRIM_ANGLE 20
 
 #ifndef CRSF_FRAMETYPE_GPS
   #define CRSF_FRAMETYPE_GPS 0x02
 #endif
+#define CRSF_GPS_FRAME_LEN 0x11  // CRSF length byte for a GPS frame: type(1) + payload(15) + crc(1)
+
+// MAVLink message IDs and their CRC_EXTRA seeds (from the MAVLink common.xml definitions)
+#define MAVLINK_MSG_GPS_RAW_INT          24
+#define MAVLINK_MSG_GPS_RAW_INT_CRC      24
+#define MAVLINK_MSG_GLOBAL_POSITION_INT  33
+#define MAVLINK_MSG_GLOBAL_POSITION_CRC  104
 
 // =======================================================================================
 // GLOBAL STATE VARIABLES & ACTIVE CONFIG
@@ -82,10 +107,12 @@ volatile double droneLon = 0;
 volatile float droneAlt = 0;
 volatile int droneSats = 0;
 volatile bool linkConnected = false;
-unsigned long lastPacketTime = 0;
+volatile unsigned long lastPacketTime = 0;   // Written from the ESP-NOW callback (WiFi task)
+unsigned long lastGpsRawTime = 0;            // Last MAVLink GPS_RAW_INT (real satellite count)
 int currentChannel = 1;
 bool channelLocked = false;
 bool usingWiFi = false;
+bool udpStarted = false;
 
 // --- Ground Station (Box) Data ---
 double boxLat = 0;
@@ -96,9 +123,10 @@ int boxSats = 0;
 float trackerHeading = 0;
 bool compassGood = false;
 bool gpsGood = false;
+bool localGpsOk = false;
 
 // --- Calibration & Tracking State ---
-int panOffset = 0; 
+float panOffset = 0;
 float altOffset = 0; 
 bool homeEstablished = false; 
 bool calibrationDone = false; 
@@ -118,7 +146,9 @@ Preferences preferences;
 Servo azServo;            
 Servo elServo;   
 bool servosAwake = false;
-uint8_t ledState = LOW; 
+float currentPanPWM = 1500;   // Smoothed servo outputs (seeded when the servos wake)
+float currentTiltPWM = 1500;
+uint8_t ledState = LOW;
 uint32_t millisLED = 0;
 
 struct Location { double lat; double lon; float alt; float hdg; float alt_ag; };
@@ -130,6 +160,8 @@ struct Vector hc_vector  = { 90, 0, 0};
 // FORWARD DECLARATIONS
 void pointServos(uint16_t az, uint16_t el);
 void getAzEl(struct Location &home, struct Location &current);
+float getDist(struct Location &a, struct Location &b);
+void StartEspNow();
 void PerformCalibration();
 void ClearFailsafe();
 void CheckFailsafe(); 
@@ -221,16 +253,16 @@ const char* htmlTemplate = R"rawliteral(
   <label>Telemetry Connection Mode <span class="req">*</span></label>
   <span class="help">How should the tracker receive GPS data from your radio?</span>
   <select name="link_type" id="link_type" onchange="toggleFields()" required>
-    <option value="2" V_LINK2>Auto-Detect (Try WiFi MAVLink, fallback to ESP-NOW CRSF)</option>
+    <option value="2" V_LINK2>Auto-Detect (Try WiFi first, fallback to ESP-NOW)</option>
     <option value="0" V_LINK0>ESP-NOW / CRSF Only (Fastest Boot)</option>
-    <option value="1" V_LINK1>WiFi UDP / MAVLink Only</option>
+    <option value="1" V_LINK1>WiFi UDP Only (MAVLink or CRSF)</option>
   </select>
 
   <div id="wifi_settings">
     <div class="row">
       <div class="col">
         <label>WiFi SSID <span class="req">*</span></label>
-        <span class="help">Your ELRS TX Backpack Wi-Fi Name</span>
+        <span class="help">Backpack AP (e.g. ExpressLRS TX Backpack XXXXXX) or your hotspot</span>
         <input type="text" name="ssid" id="ssid" value="V_SSID">
       </div>
       <div class="col">
@@ -240,7 +272,7 @@ const char* htmlTemplate = R"rawliteral(
       </div>
     </div>
     <label>UDP Listen Port <span class="req">*</span></label>
-    <span class="help">Mission Planner relay port (default is usually 14550)</span>
+    <span class="help">Backpack UDP port (default 14550). Works for MAVLink or CRSF-over-WiFi (Backpack 1.5.7+).</span>
     <input type="number" name="port" id="port" value="V_PORT">
   </div>
 
@@ -309,7 +341,7 @@ const char* htmlTemplate = R"rawliteral(
     <div class="col">
       <label>Max Pan Angle (Virtual Wall) <span class="req">*</span></label>
       <span class="help">Degrees to swing Left/Right from center. For full 270° sweep, enter 135 (135L+135R).</span>
-      <input type="number" name="max_pan" value="V_MAXPAN" required>
+      <input type="number" name="max_pan" value="V_MAXPAN" min="10" max="180" required>
     </div>
   </div>
 
@@ -320,20 +352,20 @@ const char* htmlTemplate = R"rawliteral(
 
   <div class="row">
     <div class="col">
-      <label>Tilt Min PWM (Up) <span class="req">*</span></label>
-      <span class="help">PWM for maximum upward tilt</span>
+      <label>Tilt Up PWM (90&deg;) <span class="req">*</span></label>
+      <span class="help">PWM when antennas point straight up (90&deg;). Sets the tilt scale. Higher than Horizon = reversed tilt servo.</span>
       <input type="number" name="tilt_min" value="V_TILTMIN" required>
     </div>
     <div class="col">
-      <label>Tilt Max PWM (Down) <span class="req">*</span></label>
-      <span class="help">PWM for maximum downward tilt</span>
+      <label>Tilt Down Limit PWM <span class="req">*</span></label>
+      <span class="help">Physical limit on the below-horizon side (servo is never driven past this)</span>
       <input type="number" name="tilt_max" value="V_TILTMAX" required>
     </div>
   </div>
 
   <label>Max Tilt Angle Limit <span class="req">*</span></label>
   <span class="help">Safety limit in degrees (e.g., 90 for straight up)</span>
-  <input type="number" name="max_el" value="V_MAXEL" required>
+  <input type="number" name="max_el" value="V_MAXEL" min="10" max="90" required>
 
   <button type="submit">Save & Reboot Tracker</button>
 </form>
@@ -368,7 +400,22 @@ window.onload = toggleFields;
 </body></html>
 )rawliteral";
 
+// Escape user text before inserting it into an HTML value="..." attribute
+String htmlEscape(const String &s) {
+    String out; out.reserve(s.length() + 8);
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '&') out += "&amp;";
+        else if (c == '"') out += "&quot;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else out += c;
+    }
+    return out;
+}
+
 void parseMacString(String macStr, uint8_t* macArr) {
+    memset(macArr, 0, 6);
     int arrIdx = 0; int strIdx = 0;
     while(arrIdx < 6 && strIdx < macStr.length()) {
         int commaIdx = macStr.indexOf(',', strIdx);
@@ -398,8 +445,8 @@ void StartWebConfig() {
         html.replace("V_LINK1", active_link_type == 1 ? "selected" : "");
         html.replace("V_LINK2", active_link_type == 2 ? "selected" : "");
 
-        html.replace("V_SSID", active_ssid);
-        html.replace("V_PASS", active_pass);
+        html.replace("V_SSID", htmlEscape(active_ssid));
+        html.replace("V_PASS", htmlEscape(active_pass));
         html.replace("V_PORT", active_port ? String(active_port) : "14550");
         
         String macStr = "";
@@ -449,15 +496,15 @@ void StartWebConfig() {
         preferences.putUInt("pan_min", server.arg("pan_min").toInt());
         preferences.putUInt("pan_max", server.arg("pan_max").toInt());
         
-        int p_deg = server.arg("pan_deg").toInt();
-        if (p_deg > 270) p_deg = 270; 
+        // Server-side sanity limits (a 0 here would cause a divide-by-zero in the servo math)
+        int p_deg = constrain((int)server.arg("pan_deg").toInt(), 90, 270);
         preferences.putUInt("pan_deg", p_deg);
-        
-        preferences.putUInt("max_pan", server.arg("max_pan").toInt());
+
+        preferences.putUInt("max_pan", constrain((int)server.arg("max_pan").toInt(), 10, 180));
         preferences.putUInt("tilt_h", server.arg("tilt_h").toInt());
         preferences.putUInt("tilt_min", server.arg("tilt_min").toInt());
         preferences.putUInt("tilt_max", server.arg("tilt_max").toInt());
-        preferences.putUInt("max_el", server.arg("max_el").toInt());
+        preferences.putUInt("max_el", constrain((int)server.arg("max_el").toInt(), 10, 90));
         
         preferences.putBool("rev_pan", server.arg("rev_pan").toInt() == 1);
         preferences.putBool("use_comp", server.arg("use_comp").toInt() == 1);
@@ -480,10 +527,15 @@ void StartWebConfig() {
 // =======================================================================================
 void WakeServos() {
     if (!servosAwake) {
+        // ESP32Servo ignores writes made before attach(), so attach first, then command
+        // center/horizon. min()/max() keep the limits valid for reversed servos.
+        azServo.attach(azPWM_Pin, min(active_min_az_pwm, active_max_az_pwm), max(active_min_az_pwm, active_max_az_pwm));
+        elServo.attach(elPWM_Pin, min(active_min_el_pwm, active_max_el_pwm), max(active_min_el_pwm, active_max_el_pwm));
         azServo.writeMicroseconds(active_pan_center);
         elServo.writeMicroseconds(active_tilt_horizon);
-        azServo.attach(azPWM_Pin, active_min_az_pwm, active_max_az_pwm); 
-        elServo.attach(elPWM_Pin, active_min_el_pwm, active_max_el_pwm);
+        // Seed the smoothing filter from center so the first move is eased, not a jump
+        currentPanPWM = active_pan_center;
+        currentTiltPWM = active_tilt_horizon;
         servosAwake = true;
     }
 }
@@ -491,26 +543,41 @@ void WakeServos() {
 // =======================================================================================
 // TELEMETRY PARSERS (Universal CRSF & MAVLink)
 // =======================================================================================
-void parseCRSF(const uint8_t *data, int data_len) {
-  int offset = -1;
-  for (int i = 0; i < 15; i++) {
-      if (i < data_len && data[i] == CRSF_FRAMETYPE_GPS && data_len >= i + 16) { 
-          offset = i; break; 
-      }
+// --- CRSF ------------------------------------------------------------------------------
+// The ELRS TX backpack forwards each CRSF telemetry frame over ESP-NOW wrapped in an MSP
+// packet: [MSP header ...][sync][len][type][payload...][crc8][MSP crc]. Instead of guessing a
+// fixed offset, look for a GPS frame anywhere in the packet (len byte 0x11 followed by type
+// 0x02) and only accept it if the CRSF CRC8 matches. This stops random bytes in other frame
+// types (battery, attitude, flight mode, etc.) from ever being decoded as a GPS position.
+uint8_t crsfCrc8(const uint8_t *p, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *p++;
+    for (uint8_t i = 0; i < 8; i++) crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
   }
+  return crc;
+}
 
-  if (offset != -1) {
-    uint32_t latBytes = ((uint32_t)data[offset + 1] << 24) | ((uint32_t)data[offset + 2] << 16) | ((uint32_t)data[offset + 3] << 8) | (uint32_t)data[offset + 4];
-    uint32_t lonBytes = ((uint32_t)data[offset + 5] << 24) | ((uint32_t)data[offset + 6] << 16) | ((uint32_t)data[offset + 7] << 8) | (uint32_t)data[offset + 8];
-    uint16_t altitudeRaw = (data[offset + 13] << 8) | data[offset + 14];
-    int altitude1 = altitudeRaw - 1000;
-    
+void parseCRSF(const uint8_t *data, int data_len) {
+  // i = index of the type byte. Need len byte before it and 15 payload + 1 crc after it.
+  for (int i = 1; i + 16 < data_len; i++) {
+    if (data[i] != CRSF_FRAMETYPE_GPS || data[i - 1] != CRSF_GPS_FRAME_LEN) continue;
+    if (crsfCrc8(&data[i], 16) != data[i + 16]) continue;   // CRC covers type + payload
+
+    const uint8_t *p = &data[i + 1];   // Payload (all fields big-endian)
+    int32_t lat = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+    int32_t lon = (int32_t)(((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | (uint32_t)p[7]);
+    // p[8..9] ground speed, p[10..11] heading
+    uint16_t altitudeRaw = ((uint16_t)p[12] << 8) | p[13];   // Meters MSL + 1000 offset
+    uint8_t sats = p[14];
+
     portENTER_CRITICAL(&telemetryMux);
-    droneLat = (double)((int32_t)latBytes) / 10000000.0;
-    droneLon = (double)((int32_t)lonBytes) / 10000000.0;
-    droneAlt = (altitude1 > 32767 || altitude1 < -32768) ? (altitude1 - 4294967296) : altitude1;
-    droneSats = data[offset + 15];
+    droneLat = (double)lat / 10000000.0;
+    droneLon = (double)lon / 10000000.0;
+    droneAlt = (float)altitudeRaw - 1000.0f;
+    droneSats = sats;
     portEXIT_CRITICAL(&telemetryMux);
+    return;
   }
 }
 
@@ -521,58 +588,130 @@ void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int data_
     parseCRSF(data, data_len);
 }
 
-void parseMavlink(uint8_t c) {
-    static uint8_t state = 0;
-    static uint8_t payloadLen = 0;
-    static uint8_t msgId = 0;
-    static uint8_t payload[30];
-    static uint8_t payloadIdx = 0;
+// --- MAVLink -----------------------------------------------------------------------------
+// Minimal MAVLink v1 + v2 parser with full CRC checking. Only two messages are decoded:
+//   GLOBAL_POSITION_INT (33) - lat/lon/alt used for tracking
+//   GPS_RAW_INT (24)         - real fix type + satellite count for the 8-sat "Gatekeeper"
+static inline void mavCrcAccumulate(uint8_t b, uint16_t &crc) {
+    uint8_t tmp = b ^ (uint8_t)(crc & 0xFF);
+    tmp ^= (tmp << 4);
+    crc = (crc >> 8) ^ ((uint16_t)tmp << 8) ^ ((uint16_t)tmp << 3) ^ (tmp >> 4);
+}
 
-    switch (state) {
-        case 0: if (c == 0xFD) state = 1; break; 
-        case 1: payloadLen = c; state = 2; break; 
-        case 2: case 3: case 4: case 5: case 6: state++; break; 
-        case 7: msgId = c; state = 8; break; 
-        case 8: if (c == 0) state = 9; else state = 0; break; 
-        case 9: if (c == 0 && msgId == 33) { payloadIdx = 0; state = 10; } else state = 0; break; 
-        case 10:
-            if (payloadIdx < payloadLen && payloadIdx < 30) payload[payloadIdx++] = c;
-            if (payloadIdx == payloadLen) { 
-                if (payloadLen >= 16) {
-                    uint32_t rawLat = ((uint32_t)payload[7] << 24) | ((uint32_t)payload[6] << 16) | ((uint32_t)payload[5] << 8) | (uint32_t)payload[4];
-                    uint32_t rawLon = ((uint32_t)payload[11] << 24) | ((uint32_t)payload[10] << 16) | ((uint32_t)payload[9] << 8) | (uint32_t)payload[8];
-                    uint32_t rawAlt = ((uint32_t)payload[15] << 24) | ((uint32_t)payload[14] << 16) | ((uint32_t)payload[13] << 8) | (uint32_t)payload[12]; 
+static inline int32_t mavInt32(const uint8_t *p) {   // MAVLink fields are little-endian
+    return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
 
-                    int32_t latInt = (int32_t)rawLat;
-                    int32_t lonInt = (int32_t)rawLon;
-
-                    if (latInt != 0 && lonInt != 0) { 
-                        portENTER_CRITICAL(&telemetryMux);
-                        droneLat = (double)latInt / 10000000.0;
-                        droneLon = (double)lonInt / 10000000.0;
-                        droneAlt = ((int32_t)rawAlt) / 1000.0;
-                        droneSats = 15; 
-                        portEXIT_CRITICAL(&telemetryMux);
-                    }
-                }
-                state = 0;
-            }
-            break;
+void handleMavlinkMessage(uint32_t msgId, uint8_t *payload) {
+    if (msgId == MAVLINK_MSG_GPS_RAW_INT) {
+        // Wire order: time_usec(8) lat(4) lon(4) alt(4) eph(2) epv(2) vel(2) cog(2) fix_type(1) sats(1)
+        uint8_t fixType = payload[28];
+        uint8_t sats = payload[29];
+        lastGpsRawTime = millis();
+        portENTER_CRITICAL(&telemetryMux);
+        droneSats = (fixType >= 3) ? sats : 0;   // Only count satellites once there's a 3D fix
+        portEXIT_CRITICAL(&telemetryMux);
+    }
+    else if (msgId == MAVLINK_MSG_GLOBAL_POSITION_INT) {
+        // Wire order: time_boot_ms(4) lat(4) lon(4) alt(4, mm MSL) relative_alt(4) vx vy vz hdg
+        int32_t latInt = mavInt32(&payload[4]);
+        int32_t lonInt = mavInt32(&payload[8]);
+        int32_t altMm  = mavInt32(&payload[12]);
+        if (latInt != 0 && lonInt != 0) {
+            portENTER_CRITICAL(&telemetryMux);
+            droneLat = (double)latInt / 10000000.0;
+            droneLon = (double)lonInt / 10000000.0;
+            droneAlt = altMm / 1000.0;
+            // Older behaviour as a fallback: if the FC isn't streaming GPS_RAW_INT, assume a good fix
+            if (lastGpsRawTime == 0 || millis() - lastGpsRawTime > 5000) droneSats = 15;
+            portEXIT_CRITICAL(&telemetryMux);
+        }
     }
 }
 
+void parseMavlink(uint8_t c) {
+    enum { WAIT_STX, HEADER, PAYLOAD, CRC_LO, CRC_HI };
+    static uint8_t state = WAIT_STX;
+    static bool isV2 = false;
+    static uint8_t hdr[9];          // v2: len,incompat,compat,seq,sys,comp,msgid x3 | v1: len,seq,sys,comp,msgid
+    static uint8_t hdrIdx = 0;
+    static uint8_t payloadLen = 0;
+    static uint8_t payload[255];
+    static uint16_t payloadIdx = 0;
+    static uint32_t msgId = 0;
+    static uint16_t crc = 0xFFFF;
+    static uint8_t crcLo = 0;
+
+    switch (state) {
+        case WAIT_STX:
+            if (c == 0xFD || c == 0xFE) { isV2 = (c == 0xFD); hdrIdx = 0; crc = 0xFFFF; state = HEADER; }
+            break;
+
+        case HEADER:
+            hdr[hdrIdx++] = c;
+            mavCrcAccumulate(c, crc);
+            if (hdrIdx == (isV2 ? 9 : 5)) {
+                payloadLen = hdr[0];
+                msgId = isV2 ? ((uint32_t)hdr[6] | ((uint32_t)hdr[7] << 8) | ((uint32_t)hdr[8] << 16)) : hdr[4];
+                payloadIdx = 0;
+                memset(payload, 0, sizeof(payload));   // MAVLink2 trims trailing zero bytes; restore them
+                state = (payloadLen == 0) ? CRC_LO : PAYLOAD;
+            }
+            break;
+
+        case PAYLOAD:
+            payload[payloadIdx++] = c;
+            mavCrcAccumulate(c, crc);
+            if (payloadIdx >= payloadLen) state = CRC_LO;
+            break;
+
+        case CRC_LO:
+            crcLo = c;
+            state = CRC_HI;
+            break;
+
+        case CRC_HI: {
+            state = WAIT_STX;
+            uint8_t crcExtra;
+            if (msgId == MAVLINK_MSG_GLOBAL_POSITION_INT) crcExtra = MAVLINK_MSG_GLOBAL_POSITION_CRC;
+            else if (msgId == MAVLINK_MSG_GPS_RAW_INT)    crcExtra = MAVLINK_MSG_GPS_RAW_INT_CRC;
+            else break;                                   // Not a message we use
+            uint16_t check = crc;
+            mavCrcAccumulate(crcExtra, check);
+            if (check == (uint16_t)(crcLo | (c << 8))) handleMavlinkMessage(msgId, payload);
+            break;
+        }
+    }
+}
+
+// ELRS Backpack 1.5.7+ with Telemetry = "WiFi" broadcasts CRSF telemetry over UDP (same port
+// as MAVLink, default 14550), one MSP v2 packet per datagram - the exact same bytes it sends
+// over ESP-NOW: '$' 'X' dir flags func(2) size(2) payload(size) crc  ->  size + 9 bytes total
+#define MSP_ELRS_BACKPACK_CRSF_TLM 0x0011
+bool isBackpackCrsfPacket(const uint8_t *b, int len) {
+    if (len < 9 || b[0] != '$' || b[1] != 'X') return false;
+    uint16_t func = b[4] | ((uint16_t)b[5] << 8);
+    uint16_t size = b[6] | ((uint16_t)b[7] << 8);
+    return func == MSP_ELRS_BACKPACK_CRSF_TLM && (int)size + 9 == len;
+}
+
 void readUDP() {
-    int packetSize = udp.parsePacket();
-    if (packetSize) {
+    // Drain every queued datagram each loop so telemetry never backs up
+    for (int n = 0; n < 16; n++) {
+        int packetSize = udp.parsePacket();
+        if (packetSize <= 0) break;
+
         lastPacketTime = millis();
         linkConnected = true;
         if (!channelLocked) { channelLocked = true; Serial.println("WIFI UDP LINK OK!"); }
-        
+
         uint8_t buffer[512];
         int len = udp.read(buffer, sizeof(buffer));
-        if (len > 0) {
-            for (int i = 0; i < len; i++) parseMavlink(buffer[i]);
-        }
+        if (len <= 0) continue;
+
+        // Auto-detect per packet: CRSF-over-WiFi from the backpack, otherwise MAVLink
+        if (isBackpackCrsfPacket(buffer, len)) parseCRSF(buffer, len);
+        else for (int i = 0; i < len; i++) parseMavlink(buffer[i]);
     }
 }
 
@@ -587,7 +726,9 @@ void ReadLocalGPS() {
       boxLon = (double)myGNSS.getLongitude() / 10000000.0;
       
       if (!calibrationDone) {
-          boxAlt = myGNSS.getAltitude() / 1000.0; 
+          // MSL altitude, to match what CRSF and MAVLink report for the aircraft
+          // (getAltitude() is height above the ellipsoid, which differs by tens of meters)
+          boxAlt = myGNSS.getAltitudeMSL() / 1000.0;
           hom.alt = boxAlt;
       }
       hom.lat = boxLat;
@@ -618,8 +759,10 @@ void ReadCompass() {
             trackerHeading = atan2(siny_cosp, cosy_cosp) * 180.0 / PI;
 
             if (trackerHeading < 0) trackerHeading += 360.0;
-            trackerHeading = 360.0 - trackerHeading; 
-            trackerHeading += 13.5; 
+            trackerHeading = 360.0 - trackerHeading;
+            // Magnetic declination. Because calibration stores (bearing - heading), any constant
+            // offset here cancels out, so this only changes the "Hdg" shown on the OLED.
+            trackerHeading += 13.5;
             if (trackerHeading >= 360.0) trackerHeading -= 360.0;
             if (trackerHeading < 0) trackerHeading += 360.0;
         }
@@ -629,6 +772,42 @@ void ReadCompass() {
 // =======================================================================================
 // BUTTON & CALIBRATION
 // =======================================================================================
+
+// --- 5-tap failsafe clear ---------------------------------------------------------------
+// Runs from a pin interrupt so taps are counted even while setup() is busy (GPS init,
+// WiFi scan, etc.). Quick taps never trigger calibration (that needs a 1-5s hold), so the
+// two can't be confused. The actual clear happens at the top of loop(), before the saved
+// calibration can be restored, so the servos never snap to the old position.
+#define TAP_MAX_PRESS_MS  600    // A press shorter than this counts as a tap
+#define TAP_MAX_GAP_MS    1500   // Max time between taps in a sequence
+#define TAPS_TO_CLEAR     5
+#define BUTTON_DEBOUNCE_MS 30
+
+volatile bool tapClearRequested = false;
+volatile uint8_t tapCount = 0;
+
+void IRAM_ATTR buttonISR() {
+    static bool pressed = false;
+    static unsigned long pressStart = 0;
+    static unsigned long lastEdge = 0;
+    static unsigned long lastTap = 0;
+    unsigned long now = millis();
+
+    if (digitalRead(PIN_RESET_HOME) == LOW) {
+        if (!pressed && now - lastEdge > BUTTON_DEBOUNCE_MS) { pressed = true; pressStart = now; }
+    } else if (pressed && now - pressStart > BUTTON_DEBOUNCE_MS) {
+        pressed = false;
+        if (now - pressStart < TAP_MAX_PRESS_MS) {
+            tapCount = (now - lastTap < TAP_MAX_GAP_MS) ? tapCount + 1 : 1;
+            lastTap = now;
+            if (tapCount >= TAPS_TO_CLEAR) { tapClearRequested = true; tapCount = 0; }
+        } else {
+            tapCount = 0;   // A long press breaks any tap sequence
+        }
+    }
+    lastEdge = now;
+}
+
 void checkHomeButton() {
     static unsigned long pressStart = 0;
     static bool isPressed = false;
@@ -660,8 +839,9 @@ void ClearFailsafe() {
     preferences.begin("anttrack", false);
     preferences.remove("offset"); preferences.remove("altOffset");
     preferences.remove("lat"); preferences.remove("lon"); preferences.remove("epoch");
+    preferences.remove("homeAlt");
     preferences.end();
-    panOffset = 0; calibrationDone = false;
+    panOffset = 0; altOffset = 0; calibrationDone = false;
     LogScreenPrintln("FAILSAFE", "CLEARED");
     delay(2000);
 }
@@ -675,11 +855,14 @@ void PerformCalibration() {
     cur.alt = droneAlt; 
     portEXIT_CRITICAL(&telemetryMux);
     
-    getAzEl(hom, cur); 
-    
-    if (active_use_compass) {
+    getAzEl(hom, cur);
+
+    // NOTE: in both modes the tracker assumes its center is pointing at the aircraft right now.
+    // With a compass, later rotation of the tripod is compensated for; without one it isn't.
+    if (active_use_compass && compassGood) {
         panOffset = hc_vector.az - trackerHeading;
     } else {
+        // No compass (or it failed to start): fall back to pure visual calibration
         trackerHeading = 0; panOffset = hc_vector.az;
     }
 
@@ -700,7 +883,8 @@ void PerformCalibration() {
     
     preferences.begin("anttrack", false);
     preferences.putFloat("offset", (float)panOffset);
-    preferences.putFloat("altOffset", (float)altOffset); 
+    preferences.putFloat("altOffset", (float)altOffset);
+    preferences.putFloat("homeAlt", hom.alt);   // altOffset is only meaningful paired with this
     preferences.putDouble("lat", hom.lat);
     preferences.putDouble("lon", hom.lon);
     preferences.putUInt("epoch", currentEpoch); 
@@ -718,6 +902,9 @@ void CheckFailsafe() {
     double savedLon = preferences.getDouble("lon", 0);
     float savedOffset = preferences.getFloat("offset", 0);
     uint32_t savedEpoch = preferences.getUInt("epoch", 0);
+    bool hasAltData = preferences.isKey("homeAlt");
+    float savedAltOffset = preferences.getFloat("altOffset", 0);
+    float savedHomeAlt = preferences.getFloat("homeAlt", 0);
     preferences.end();
     
     if (savedLat == 0 || savedEpoch == 0) return; 
@@ -738,13 +925,40 @@ void CheckFailsafe() {
         
         getAzEl(hom, cur); 
         if (hc_vector.dist > MIN_TRACKING_DIST) { 
-            panOffset = (int)savedOffset;
+            panOffset = savedOffset;
+            // Restore the altitude reference too, otherwise tilt is off after a power bump
+            if (hasAltData) { hom.alt = savedHomeAlt; altOffset = savedAltOffset; }
             calibrationDone = true;
             WakeServos();
             LogScreenPrintln("FAILSAFE!", "Restored Cal");
             delay(2000);
         }
     }
+}
+
+// =======================================================================================
+// ESP-NOW (CRSF) LINK
+// =======================================================================================
+void StartEspNow() {
+    usingWiFi = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    // The ELRS backpack clears the lowest bit of the first UID byte before using the UID as
+    // its MAC address (a MAC with that bit set is a multicast address and is rejected by the
+    // ESP32). We must do the same, otherwise any binding phrase whose first UID byte is odd
+    // fails silently and the tracker never hears the backpack.
+    uint8_t mac[6];
+    memcpy(mac, active_mac, 6);
+    mac[0] &= ~0x01;
+    if (esp_wifi_set_mac(WIFI_IF_STA, mac) != ESP_OK) {
+        LogScreenPrintln("MAC FAIL", "Check UID bytes");
+        delay(3000);
+    }
+
+    if (esp_now_init() != ESP_OK) ESP.restart();
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 }
 
 // =======================================================================================
@@ -790,9 +1004,23 @@ void setup() {
   preferences.end();
 
   // --- 2. THE "FIRST BOOT" TRAP ---
-  if (!is_configured || digitalRead(PIN_RESET_HOME) == LOW) {
-      StartWebConfig(); 
+  // Config mode needs the button held through the first 1.5s of boot, so a stray tap
+  // (e.g. starting the 5-tap failsafe clear a bit early) doesn't land you in config mode.
+  bool configHeld = false;
+  if (digitalRead(PIN_RESET_HOME) == LOW) {
+      configHeld = true;
+      unsigned long t0 = millis();
+      while (millis() - t0 < 1500) {
+          if (digitalRead(PIN_RESET_HOME) == HIGH) { configHeld = false; break; }
+          delay(10);
+      }
   }
+  if (!is_configured || configHeld) {
+      StartWebConfig();
+  }
+
+  // Count quick taps from here on (5 taps = clear saved failsafe calibration)
+  attachInterrupt(digitalPinToInterrupt(PIN_RESET_HOME), buttonISR, CHANGE);
   
   // --- 3. INIT COMPASS (If Toggled ON) ---
   if (active_use_compass) {
@@ -819,20 +1047,27 @@ void setup() {
       gpsSerial.updateBaudRate(38400);
       if (myGNSS.begin(gpsSerial) == false) {
           gpsSerial.updateBaudRate(115200);
-          if (myGNSS.begin(gpsSerial) == false) { LogScreenPrintln("GPS FAIL", "Check Wires"); delay(2000); } 
-          else { LogScreenPrintln("GPS OK", "115200bd"); }
-      } else { LogScreenPrintln("GPS OK", "38400bd"); }
-  } else { LogScreenPrintln("GPS OK", "9600bd"); }
+          if (myGNSS.begin(gpsSerial) == false) { LogScreenPrintln("GPS FAIL", "Check Wires"); delay(2000); }
+          else { localGpsOk = true; LogScreenPrintln("GPS OK", "115200bd"); }
+      } else { localGpsOk = true; LogScreenPrintln("GPS OK", "38400bd"); }
+  } else { localGpsOk = true; LogScreenPrintln("GPS OK", "9600bd"); }
 
-  myGNSS.setI2COutput(COM_TYPE_UBX); 
-  myGNSS.setNavigationFrequency(5);  
-  
+  if (localGpsOk) {
+      // UBX only on the UART: NMEA sentences at 5Hz would saturate a 9600 baud link
+      myGNSS.setUART1Output(COM_TYPE_UBX);
+      myGNSS.setNavigationFrequency(5);
+      // Have the GPS push position reports on its own. Without this, every getXXX() call
+      // sends a poll and blocks the main loop until the GPS answers (~100ms+ per loop).
+      myGNSS.setAutoPVT(true);
+  }
+
   // --- 5. TELEMETRY LINK INITIALIZATION ---
   if (active_link_type == 1 || active_link_type == 2) {
       LogScreenPrintln("Scanning WiFi...");
       WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);   // Modem sleep adds latency and drops UDP packets
       WiFi.begin(active_ssid.c_str(), active_pass.c_str());
-      
+
       unsigned long startAttempt = millis();
       int timeout = (active_link_type == 1) ? 30000 : 12000;
       while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < timeout) delay(100);
@@ -840,29 +1075,22 @@ void setup() {
       if (WiFi.status() == WL_CONNECTED) {
           usingWiFi = true;
           udp.begin(active_port);
+          udpStarted = true;
           String ipStr = WiFi.localIP().toString();
           LogScreenPrintln("WiFi UDP Lock", ipStr);
       } else {
           if (active_link_type == 2) {
-              usingWiFi = false;
-              WiFi.disconnect();
-              esp_wifi_set_mac(WIFI_IF_STA, active_mac);
-              if (esp_now_init() != ESP_OK) ESP.restart();
-              esp_now_register_recv_cb(OnDataRecv);
-              esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+              StartEspNow();
               LogScreenPrintln("CRSF Fallback", "ESP-NOW");
           } else {
-              LogScreenPrintln("WiFi Timeout", "Check AP/Pass");
+              // WiFi-only mode: stay in WiFi mode and keep trying in the background.
+              // UDP is started from loop() as soon as the backpack AP shows up.
+              usingWiFi = true;
+              LogScreenPrintln("WiFi Timeout", "Still trying...");
           }
       }
   } else if (active_link_type == 0) {
-      usingWiFi = false;
-      WiFi.mode(WIFI_STA);
-      WiFi.disconnect();
-      esp_wifi_set_mac(WIFI_IF_STA, active_mac);
-      if (esp_now_init() != ESP_OK) ESP.restart();
-      esp_now_register_recv_cb(OnDataRecv);
-      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+      StartEspNow();
       LogScreenPrintln("CRSF Locked", "ESP-NOW");
   }
   delay(1500);
@@ -881,15 +1109,28 @@ void setup() {
 // =======================================================================================
 // MAIN LOOP
 // =======================================================================================
-void loop() {            
+void loop() {
+  // 5 quick taps on the button (any time, even during boot) wipes the saved calibration
+  if (tapClearRequested) { tapClearRequested = false; ClearFailsafe(); }
+
   ReadCompass();
   ReadLocalGPS();
 
+  // Signed math: the ESP-NOW callback runs on the other core and may update lastPacketTime
+  // between our two reads; unsigned subtraction would then wrap and look like a timeout.
+  unsigned long nowMs = millis();
+  long sinceLastPacket = (long)(nowMs - lastPacketTime);
+
   if (usingWiFi) {
-      readUDP();
-      if (millis() - lastPacketTime > 2000) { channelLocked = false; linkConnected = false; }
+      // (Re)open the UDP socket whenever the backpack WiFi (re)connects
+      bool wifiUp = (WiFi.status() == WL_CONNECTED);
+      if (wifiUp && !udpStarted) { udp.stop(); udp.begin(active_port); udpStarted = true; }
+      else if (!wifiUp && udpStarted) { udpStarted = false; }
+
+      if (udpStarted) readUDP();
+      if (sinceLastPacket > 2000) { channelLocked = false; linkConnected = false; }
   } else {
-      if (millis() - lastPacketTime > 2000) {
+      if (sinceLastPacket > 2000) {
         channelLocked = false; linkConnected = false; 
         currentChannel++; if (currentChannel > 13) currentChannel = 1;
         esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
@@ -906,7 +1147,7 @@ void loop() {
       cur.alt = droneAlt;
       portEXIT_CRITICAL(&telemetryMux);
       
-      cur.alt_ag = cur.alt - hom.alt; 
+      cur.alt_ag = cur.alt - hom.alt - altOffset;   // Height above the calibrated ground level
       gpsGood = true;       
   }
 
@@ -968,7 +1209,9 @@ void loop() {
      }
   }
   else if (!calibrationDone) {
-     if (linkConnected) CheckFailsafe(); 
+     // Check for a saved calibration once a second (it reads flash + GPS time)
+     static unsigned long failsafeTimer = 0;
+     if (linkConnected && millis() - failsafeTimer > 1000) { failsafeTimer = millis(); CheckFailsafe(); }
      static unsigned long warnTimer = 0;
      if (millis() - warnTimer > 1000) { 
         warnTimer = millis();
@@ -1032,19 +1275,20 @@ void pointServos(uint16_t az, uint16_t el) {
 
   deviation = constrain(deviation, -active_max_pan, active_max_pan);
 
-  float usPerDegree = (active_max_az_pwm - active_min_az_pwm) / (float)active_pan_servo_degrees;
+  float usPerDegree = abs(active_max_az_pwm - active_min_az_pwm) / (float)max(active_pan_servo_degrees, 1);
   int targetPanPWM = active_pan_center + (int)(deviation * usPerDegree);
   
-  targetPanPWM = constrain(targetPanPWM, active_min_az_pwm, active_max_az_pwm);
+  targetPanPWM = constrain(targetPanPWM, min(active_min_az_pwm, active_max_az_pwm), max(active_min_az_pwm, active_max_az_pwm));
 
-  if (el < 0) el = 0;
-  if (el > active_max_el) el = active_max_el; 
-  
-  int targetTiltPWM = map(el, 0, 90, active_tilt_horizon, 1000); 
-  targetTiltPWM = constrain(targetTiltPWM, 1000, 1600);
+  if (el > active_max_el) el = active_max_el;
 
-  static float currentPanPWM = targetPanPWM;   
-  static float currentTiltPWM = targetTiltPWM; 
+  // Tilt scale comes from the web UI: Horizon PWM = 0 deg, "Tilt Up PWM" = 90 deg (straight up).
+  // (Previously hard-coded to 1000us = 90 deg and clamped to 1000-1600us, ignoring the settings.)
+  // If Up PWM is higher than Horizon the mapping simply runs the other way (reversed servo).
+  int targetTiltPWM = map(el, 0, 90, active_tilt_horizon, active_min_el_pwm);
+  targetTiltPWM = constrain(targetTiltPWM, min(active_min_el_pwm, active_max_el_pwm), max(active_min_el_pwm, active_max_el_pwm));
+
+  // currentPanPWM / currentTiltPWM are globals, seeded in WakeServos()
   static unsigned long lastMoveTime = 0;
 
   if (millis() - lastMoveTime > 20) {
