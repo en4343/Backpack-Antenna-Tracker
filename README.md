@@ -73,12 +73,35 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 ## 🚀 Setup & Configuration
 
 ### Step 1: Flash the Firmware
+<<<<<<< HEAD
+You do not need to install the Arduino IDE or edit any code! Each release includes two firmware files:
+
+| File | Use it for | Flash address | Keeps your settings? |
+| :--- | :--- | :--- | :--- |
+| `CRSF_Tracker.ino.merged.bin` | **First install** on a new/blank ESP32 | `0x0` | ❌ No, erases everything |
+| `CRSF_Tracker.ino.bin` | **Updating** a tracker that already runs this firmware | `0x10000` | ✅ Yes |
+
+**First install (new board):**
+1. Go to the [Espressif Web Flasher](https://espressif.github.io/esptool-js/) (use Chrome or Edge).
+2. Connect your ESP32 via USB and click **Connect**. *(Tip: Block the 5V pin on your USB cable with tape to prevent the board from trying to pull servo power from your PC).* If no port shows up, install the USB driver for your board's USB chip (CP2102 or CH340).
+=======
 You do not need to install the Arduino IDE or edit any code!
 1. Go to the [Espressif Web Flasher](https://espressif.github.io/esptool-js/).
 2. Connect your ESP32 via USB and click **Connect**. *(Tip: Block the 5V pin on your USB cable with tape to prevent the board from trying to pull servo power from your PC).*
+>>>>>>> b1f730a3b2bcd00799eaaebee84aef60363ae8b2
 3. Select the `CRSF_Tracker.ino.merged.bin` file from the releases page.
 4. **CRITICAL:** Ensure the Flash Address is set to `0x0`.
-5. Click **Program**.
+5. Click **Program**. When it finishes, the tracker boots into Config Mode (Step 3).
+
+**Updating to a new release (keeps your settings):**
+1. Connect to the [Espressif Web Flasher](https://espressif.github.io/esptool-js/) as above.
+2. Select `CRSF_Tracker.ino.bin` (the file *without* "merged" in the name).
+3. **CRITICAL:** Set the Flash Address to `0x10000`. *Do not* click "Erase Flash".
+4. Click **Program**. Your Web UI settings (servo limits, UID, WiFi, etc.) are kept.
+
+> ⚠️ Flashing the `merged.bin` again also works for an update, but it wipes your saved settings and any saved failsafe calibration, so you'll have to fill out the Config page again. If anything goes wrong with an app-only update (boot loop, strange behaviour), do a clean first install with the `merged.bin`.
+
+**Compatibility:** The firmware works on any board built on the original ESP32 chip with 4MB (or more) flash: ESP32-WROOM-32 / 32D / 32E / 32UE and WROVER modules, 30-pin or 38-pin dev boards. It will **not** run on ESP32-S2, S3, C3 or C6 boards, or on rare 2MB-flash boards.
 
 ### Step 2: Find your ELRS Binding MAC Address (CRSF Users)
 Because this tracker sniffs raw packets directly out of the air, it must impersonate your specific transmitter by converting your ELRS Binding Phrase into a 6-digit UID array.
@@ -201,8 +224,13 @@ Only needed if you want to change the code (e.g., the OLED address or `SERVO_SPE
    * `Adafruit BNO08x` (pulls in Adafruit BusIO and Adafruit Unified Sensor)
    * `Adafruit SSD1306` and `Adafruit GFX Library`
    * `SparkFun u-blox GNSS Arduino Library` (the **v2** library, not "v3")
+<<<<<<< HEAD
+4. Open `CRSF_Tracker/CRSF_Tracker.ino`, select board **ESP32 Dev Module** (or **DOIT ESP32 DEVKIT V1**), and upload.
+5. To make release files, use **Sketch → Export Compiled Binary**. In the `build/...` folder it creates, attach both `CRSF_Tracker.ino.merged.bin` (first install, `0x0`) and `CRSF_Tracker.ino.bin` (updates, `0x10000`) to the GitHub release.
+=======
 4. Open `CRSF_Tracker/CRSF_Tracker.ino`, select board **DOIT ESP32 DEVKIT V1**, and upload.
 5. To make a web-flashable file, use **Sketch → Export Compiled Binary**. The `build/.../CRSF_Tracker.ino.merged.bin` it creates is the file to flash at address `0x0`.
+>>>>>>> b1f730a3b2bcd00799eaaebee84aef60363ae8b2
 
 <details>
 <summary><b>🎛️ Live RF Trim Knob</b></summary>
