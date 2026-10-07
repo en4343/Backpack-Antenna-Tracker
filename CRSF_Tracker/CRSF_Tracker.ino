@@ -13,6 +13,9 @@
       - WiFi mode also accepts CRSF telemetry over UDP (ELRS Backpack 1.5.7+ "WiFi" telemetry)
       - 5 quick taps on the button clears the saved failsafe calibration, even during boot
       - Config mode now needs the button held for 1.5s at power-on (stray taps won't enter it)
+      - Two saved WiFi networks; boot scan joins whichever is on the air; screen shows the SSID
+      - UDP: read whole datagrams (large DroneBridge packets used to stall reception) and send a
+        1Hz MAVLink heartbeat so bridges like DroneBridge register the tracker
       - GPS: UBX-only + autoPVT so the main loop no longer blocks on every GPS read
       - Tilt now uses the web UI PWM settings instead of hard-coded 1000-1600us
       - Power-bump failsafe also restores the altitude reference
@@ -84,6 +87,8 @@ bool is_configured = false;
 int active_link_type; // 0=ESP-NOW, 1=WiFi, 2=Auto
 String active_ssid;
 String active_pass;
+String active_ssid2;   // Optional second WiFi network (e.g. DroneBridge)
+String active_pass2;
 uint16_t active_port;
 uint8_t active_mac[6];
 
@@ -113,6 +118,14 @@ int currentChannel = 1;
 bool channelLocked = false;
 bool usingWiFi = false;
 bool udpStarted = false;
+String connectedSsid = "";   // Which saved network we joined (shown on the OLED)
+
+// --- WiFi link diagnostics (shown on the "No Link" screen, printed to Serial) ---
+uint32_t diagPkts = 0, diagFrames = 0, diagOk = 0, diagBad = 0;   // per-second counters
+uint32_t totPkts = 0, totOk = 0;                                   // totals since boot
+unsigned long lastCrsfUdpTime = 0;                                 // last CRSF-over-WiFi packet (ELRS backpack)
+unsigned long diagLastPkt = 0, diagMaxGap = 0;                     // gap between datagrams
+String diagLine = "";                                              // last 1s summary for the OLED
 
 // --- Ground Station (Box) Data ---
 double boxLat = 0;
@@ -162,6 +175,9 @@ void pointServos(uint16_t az, uint16_t el);
 void getAzEl(struct Location &home, struct Location &current);
 float getDist(struct Location &a, struct Location &b);
 void StartEspNow();
+bool ConnectSavedWiFi(unsigned long timeoutMs);
+void ServiceWiFiReconnect();
+String shortText(const String &s, unsigned int maxLen);
 void PerformCalibration();
 void ClearFailsafe();
 void CheckFailsafe(); 
@@ -188,6 +204,12 @@ void LogScreenPrintln(String s, String s2 = "") {
   if(boxGPSFixed) display.print(" [FIX]");
   display.setCursor(0, 55); display.print("Drone:   "); display.print(droneSats);
   display.display();
+}
+
+// Trim long text (e.g. "ExpressLRS TX Backpack 3A4B5C") to fit the 21-char OLED line
+String shortText(const String &s, unsigned int maxLen) {
+  if (s.length() <= maxLen) return s;
+  return s.substring(0, maxLen - 1) + "~";
 }
 
 void UpdateDisplay(int targetAz, int trimVal) {
@@ -224,6 +246,10 @@ void UpdateDisplay(int targetAz, int trimVal) {
         display.print(trimVal);
         display.println("");
     }
+
+    // Which link is feeding the tracker
+    if (usingWiFi) { display.print("WiFi:"); display.println(shortText(connectedSsid, 16)); }
+    else display.println("Link: ESP-NOW");
     display.display();
   }
 }
@@ -259,16 +285,29 @@ const char* htmlTemplate = R"rawliteral(
   </select>
 
   <div id="wifi_settings">
+    <span class="help">The tracker scans at boot and joins whichever saved network is on the air. Network 1 wins if both are visible.</span>
     <div class="row">
       <div class="col">
-        <label>WiFi SSID <span class="req">*</span></label>
-        <span class="help">Backpack AP (e.g. ExpressLRS TX Backpack XXXXXX) or your hotspot</span>
+        <label>WiFi Network 1 (SSID) <span class="req">*</span></label>
+        <span class="help">e.g. ExpressLRS TX Backpack XXXXXX</span>
         <input type="text" name="ssid" id="ssid" value="V_SSID">
       </div>
       <div class="col">
-        <label>WiFi Password <span class="req">*</span></label>
-        <span class="help">Your Backpack Password</span>
+        <label>Network 1 Password</label>
+        <span class="help">Backpack default: expresslrs</span>
         <input type="text" name="pass" id="pass" value="V_PASS">
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>WiFi Network 2 (SSID)</label>
+        <span class="help">Optional, e.g. your DroneBridge AP</span>
+        <input type="text" name="ssid2" id="ssid2" value="V_NET2SSID">
+      </div>
+      <div class="col">
+        <label>Network 2 Password</label>
+        <span class="help">Leave blank if unused</span>
+        <input type="text" name="pass2" id="pass2" value="V_NET2PASS">
       </div>
     </div>
     <label>UDP Listen Port <span class="req">*</span></label>
@@ -382,15 +421,15 @@ function toggleFields() {
 
   if(val == '0') {
     // ESP-NOW Only
-    w.style.display = 'none'; s.required = false; p.required = false; pt.required = false;
+    w.style.display = 'none'; s.required = false; pt.required = false;
     e.style.display = 'block'; m.required = true;
   } else if(val == '1') {
     // WiFi Only
-    w.style.display = 'block'; s.required = true; p.required = true; pt.required = true;
+    w.style.display = 'block'; s.required = true; pt.required = true;
     e.style.display = 'none'; m.required = false;
   } else {
     // Auto-Detect
-    w.style.display = 'block'; s.required = true; p.required = true; pt.required = true;
+    w.style.display = 'block'; s.required = true; pt.required = true;
     e.style.display = 'block'; m.required = true;
   }
 }
@@ -445,6 +484,8 @@ void StartWebConfig() {
         html.replace("V_LINK1", active_link_type == 1 ? "selected" : "");
         html.replace("V_LINK2", active_link_type == 2 ? "selected" : "");
 
+        html.replace("V_NET2SSID", htmlEscape(active_ssid2));
+        html.replace("V_NET2PASS", htmlEscape(active_pass2));
         html.replace("V_SSID", htmlEscape(active_ssid));
         html.replace("V_PASS", htmlEscape(active_pass));
         html.replace("V_PORT", active_port ? String(active_port) : "14550");
@@ -486,6 +527,8 @@ void StartWebConfig() {
         
         preferences.putString("ssid", server.arg("ssid"));
         preferences.putString("pass", server.arg("pass"));
+        preferences.putString("ssid2", server.arg("ssid2"));
+        preferences.putString("pass2", server.arg("pass2"));
         preferences.putUInt("port", server.arg("port").toInt());
         
         uint8_t tempMac[6];
@@ -672,13 +715,15 @@ void parseMavlink(uint8_t c) {
 
         case CRC_HI: {
             state = WAIT_STX;
+            diagFrames++;
             uint8_t crcExtra;
             if (msgId == MAVLINK_MSG_GLOBAL_POSITION_INT) crcExtra = MAVLINK_MSG_GLOBAL_POSITION_CRC;
             else if (msgId == MAVLINK_MSG_GPS_RAW_INT)    crcExtra = MAVLINK_MSG_GPS_RAW_INT_CRC;
             else break;                                   // Not a message we use
             uint16_t check = crc;
             mavCrcAccumulate(crcExtra, check);
-            if (check == (uint16_t)(crcLo | (c << 8))) handleMavlinkMessage(msgId, payload);
+            if (check == (uint16_t)(crcLo | (c << 8))) { diagOk++; totOk++; handleMavlinkMessage(msgId, payload); }
+            else diagBad++;
             break;
         }
     }
@@ -695,6 +740,37 @@ bool isBackpackCrsfPacket(const uint8_t *b, int len) {
     return func == MSP_ELRS_BACKPACK_CRSF_TLM && (int)size + 9 == len;
 }
 
+// Some WiFi bridges (e.g. DroneBridge for ESP32) only send telemetry to devices that have
+// sent them packets. So on MAVLink links the tracker sends a standard MAVLink HEARTBEAT (as an
+// antenna tracker, system ID 252) to the network's gateway once a second, like any ground
+// station. It doesn't affect the GCS failsafe (that only watches SYSID_MYGCS, normally 255).
+void SendRegistrationHeartbeat() {
+    static uint8_t seq = 0;
+    uint8_t pkt[17];
+    pkt[0] = 0xFE;      // MAVLink v1
+    pkt[1] = 9;         // payload length
+    pkt[2] = seq++;
+    pkt[3] = 252;       // system ID (not 255, so it isn't mistaken for the GCS)
+    pkt[4] = 1;         // component ID
+    pkt[5] = 0;         // msg ID 0 = HEARTBEAT
+    // Payload (wire order): custom_mode u32, type, autopilot, base_mode, system_status, mavlink_version
+    pkt[6] = pkt[7] = pkt[8] = pkt[9] = 0;
+    pkt[10] = 5;        // MAV_TYPE_ANTENNA_TRACKER
+    pkt[11] = 8;        // MAV_AUTOPILOT_INVALID
+    pkt[12] = 0;        // base_mode
+    pkt[13] = 4;        // MAV_STATE_ACTIVE
+    pkt[14] = 3;        // MAVLink version
+    uint16_t crc = 0xFFFF;
+    for (int i = 1; i < 15; i++) mavCrcAccumulate(pkt[i], crc);
+    mavCrcAccumulate(50, crc);   // CRC_EXTRA for HEARTBEAT
+    pkt[15] = crc & 0xFF;
+    pkt[16] = crc >> 8;
+
+    udp.beginPacket(WiFi.gatewayIP(), active_port);
+    udp.write(pkt, sizeof(pkt));
+    udp.endPacket();
+}
+
 void readUDP() {
     // Drain every queued datagram each loop so telemetry never backs up
     for (int n = 0; n < 16; n++) {
@@ -705,12 +781,20 @@ void readUDP() {
         linkConnected = true;
         if (!channelLocked) { channelLocked = true; Serial.println("WIFI UDP LINK OK!"); }
 
-        uint8_t buffer[512];
+        // Read the WHOLE datagram. The ESP32 UDP library won't report any new packet until the
+        // current one is fully read, so a datagram bigger than our buffer (DroneBridge sends up
+        // to 576 bytes; the old 512-byte buffer) would leave the tracker deaf after one packet.
+        static uint8_t buffer[1500];   // >= WiFi MTU, so any UDP datagram fits
         int len = udp.read(buffer, sizeof(buffer));
+        udp.clear();                   // Belt and braces: drop anything left over
+        unsigned long nowPkt = millis();
+        if (diagLastPkt && nowPkt - diagLastPkt > diagMaxGap) diagMaxGap = nowPkt - diagLastPkt;
+        diagLastPkt = nowPkt;
+        diagPkts++; totPkts++;
         if (len <= 0) continue;
 
         // Auto-detect per packet: CRSF-over-WiFi from the backpack, otherwise MAVLink
-        if (isBackpackCrsfPacket(buffer, len)) parseCRSF(buffer, len);
+        if (isBackpackCrsfPacket(buffer, len)) { lastCrsfUdpTime = millis(); parseCRSF(buffer, len); }
         else for (int i = 0; i < len; i++) parseMavlink(buffer[i]);
     }
 }
@@ -937,6 +1021,69 @@ void CheckFailsafe() {
 }
 
 // =======================================================================================
+// WIFI (UDP) LINK - up to two saved networks
+// =======================================================================================
+// Index (0 or 1) of the first saved network present in the current scan results, else -1.
+// Network 1 is checked first, so it wins if both are on the air.
+int pickSavedNetwork(int found) {
+    const String *ssids[2] = { &active_ssid, &active_ssid2 };
+    for (int k = 0; k < 2; k++) {
+        if (ssids[k]->length() == 0) continue;
+        for (int i = 0; i < found; i++) {
+            if (WiFi.SSID(i) == *ssids[k]) return k;
+        }
+    }
+    return -1;
+}
+
+void beginSavedNetwork(int k) {
+    connectedSsid = (k == 0) ? active_ssid : active_ssid2;
+    const String &pw = (k == 0) ? active_pass : active_pass2;
+    WiFi.begin(connectedSsid.c_str(), pw.c_str());
+}
+
+// Boot: scan once (~2s), join the first saved network that's visible.
+bool ConnectSavedWiFi(unsigned long timeoutMs) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);          // Modem sleep adds latency and drops UDP packets
+    WiFi.setAutoReconnect(false);  // We choose (and re-choose) the network ourselves
+    LogScreenPrintln("WiFi Scan");
+    int16_t found = WiFi.scanNetworks(false, false, false, 150);
+    int k = (found > 0) ? pickSavedNetwork(found) : -1;
+    WiFi.scanDelete();
+    if (k < 0) return false;
+
+    beginSavedNetwork(k);
+    LogScreenPrintln("Joining..", shortText(connectedSsid, 21));
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(100);
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// loop(), WiFi mode, while disconnected: every 15s run a background (non-blocking) scan and
+// join whichever saved network is on the air. Handles a network going away and the other
+// one appearing, e.g. switching the backpack off WiFi while DroneBridge is still up.
+void ServiceWiFiReconnect() {
+    static unsigned long lastTry = 0;
+    static bool scanning = false;
+
+    if (scanning) {
+        int16_t found = WiFi.scanComplete();
+        if (found == WIFI_SCAN_RUNNING) return;
+        scanning = false;
+        int k = (found > 0) ? pickSavedNetwork(found) : -1;
+        WiFi.scanDelete();
+        if (k >= 0) { beginSavedNetwork(k); lastTry = millis(); }
+        return;
+    }
+    if (lastTry == 0 || millis() - lastTry > 15000) {
+        lastTry = millis();
+        WiFi.disconnect();   // Abandon any half-finished join before scanning
+        if (WiFi.scanNetworks(true, false, false, 150) == WIFI_SCAN_RUNNING) scanning = true;
+    }
+}
+
+// =======================================================================================
 // ESP-NOW (CRSF) LINK
 // =======================================================================================
 void StartEspNow() {
@@ -983,6 +1130,8 @@ void setup() {
       active_link_type = preferences.getUInt("link_type", 2);
       active_ssid = preferences.getString("ssid", ""); 
       active_pass = preferences.getString("pass", "");
+      active_ssid2 = preferences.getString("ssid2", "");
+      active_pass2 = preferences.getString("pass2", "");
       active_port = preferences.getUInt("port", 14550);
       preferences.getBytes("mac", active_mac, 6); 
 
@@ -1063,31 +1212,21 @@ void setup() {
 
   // --- 5. TELEMETRY LINK INITIALIZATION ---
   if (active_link_type == 1 || active_link_type == 2) {
-      LogScreenPrintln("Scanning WiFi...");
-      WiFi.mode(WIFI_STA);
-      WiFi.setSleep(false);   // Modem sleep adds latency and drops UDP packets
-      WiFi.begin(active_ssid.c_str(), active_pass.c_str());
-
-      unsigned long startAttempt = millis();
-      int timeout = (active_link_type == 1) ? 30000 : 12000;
-      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < timeout) delay(100);
-
-      if (WiFi.status() == WL_CONNECTED) {
+      // Scan, then join whichever saved network (1 or 2) is on the air
+      unsigned long timeout = (active_link_type == 1) ? 30000 : 12000;
+      if (ConnectSavedWiFi(timeout)) {
           usingWiFi = true;
           udp.begin(active_port);
           udpStarted = true;
-          String ipStr = WiFi.localIP().toString();
-          LogScreenPrintln("WiFi UDP Lock", ipStr);
+          LogScreenPrintln("WiFi OK", shortText(connectedSsid, 21));
+      } else if (active_link_type == 2) {
+          // Auto-Detect: neither network found (or join failed) -> ESP-NOW for this session
+          StartEspNow();
+          LogScreenPrintln("ESP-NOW", "No WiFi found");
       } else {
-          if (active_link_type == 2) {
-              StartEspNow();
-              LogScreenPrintln("CRSF Fallback", "ESP-NOW");
-          } else {
-              // WiFi-only mode: stay in WiFi mode and keep trying in the background.
-              // UDP is started from loop() as soon as the backpack AP shows up.
-              usingWiFi = true;
-              LogScreenPrintln("WiFi Timeout", "Still trying...");
-          }
+          // WiFi-only mode: keep scanning for either network in the background (loop()).
+          usingWiFi = true;
+          LogScreenPrintln("No WiFi", "Still searching...");
       }
   } else if (active_link_type == 0) {
       StartEspNow();
@@ -1119,6 +1258,26 @@ void loop() {
   // Signed math: the ESP-NOW callback runs on the other core and may update lastPacketTime
   // between our two reads; unsigned subtraction would then wrap and look like a timeout.
   unsigned long nowMs = millis();
+
+  // Once a second: summarize WiFi/UDP reception (p=datagrams, f=MAVLink frames,
+  // ok/x=good/bad position+GPS messages, g=longest gap between datagrams in ms)
+  if (usingWiFi) {
+      static unsigned long diagTimer = 0;
+      if (nowMs - diagTimer >= 1000) {
+          diagTimer = nowMs;
+          char buf[32];
+          snprintf(buf, sizeof(buf), "p%lu f%lu ok%lu x%lu g%lu", (unsigned long)diagPkts, (unsigned long)diagFrames,
+                   (unsigned long)diagOk, (unsigned long)diagBad, diagMaxGap);
+          Serial.printf("[UDP] %s  total p%lu ok%lu  (since last pkt %lu ms)\n", buf, (unsigned long)totPkts,
+                        (unsigned long)totOk, diagLastPkt ? nowMs - diagLastPkt : 0UL);
+          // OLED: totals since boot + seconds since the last packet ("-" = never)
+          char ago[16];
+          if (diagLastPkt) snprintf(ago, sizeof(ago), "%lus", (nowMs - diagLastPkt) / 1000); else strcpy(ago, "-");
+          snprintf(buf, sizeof(buf), "P%lu ok%lu last%s", (unsigned long)totPkts, (unsigned long)totOk, ago);
+          diagLine = buf;
+          diagPkts = diagFrames = diagOk = diagBad = 0; diagMaxGap = 0;
+      }
+  }
   long sinceLastPacket = (long)(nowMs - lastPacketTime);
 
   if (usingWiFi) {
@@ -1126,9 +1285,22 @@ void loop() {
       bool wifiUp = (WiFi.status() == WL_CONNECTED);
       if (wifiUp && !udpStarted) { udp.stop(); udp.begin(active_port); udpStarted = true; }
       else if (!wifiUp && udpStarted) { udpStarted = false; }
+      if (!wifiUp) ServiceWiFiReconnect();
 
-      if (udpStarted) readUDP();
-      if (sinceLastPacket > 2000) { channelLocked = false; linkConnected = false; }
+      if (udpStarted) {
+          readUDP();
+          // MAVLink bridges like DroneBridge only send to devices that talk to them, and may drop
+          // ones that go quiet, so send a heartbeat once a second like any ground station does.
+          // Skipped when the data is CRSF-over-WiFi from an ELRS backpack (it doesn't need it).
+          static unsigned long helloTimer = 0;
+          bool crsfSource = lastCrsfUdpTime && (millis() - lastCrsfUdpTime < 10000);
+          if (!crsfSource && millis() - helloTimer > 1000) {
+              helloTimer = millis();
+              SendRegistrationHeartbeat();
+          }
+      }
+      // Re-measure after reading, so a packet that just arrived isn't immediately timed out
+      if ((long)(millis() - lastPacketTime) > 2000) { channelLocked = false; linkConnected = false; }
   } else {
       if (sinceLastPacket > 2000) {
         channelLocked = false; linkConnected = false; 
@@ -1197,7 +1369,7 @@ void loop() {
      static unsigned long warnTimer = 0;
      if (millis() - warnTimer > 1000) {
         warnTimer = millis();
-        if (usingWiFi) LogScreenPrintln("LINK LOST", WiFi.localIP().toString());
+        if (usingWiFi) LogScreenPrintln("LINK LOST", WiFi.status() == WL_CONNECTED ? (diagLine.length() ? diagLine : shortText(connectedSsid, 21)) : String("WiFi searching..."));
         else LogScreenPrintln("LINK LOST", "ESP-NOW");
      }
   }
@@ -1216,8 +1388,8 @@ void loop() {
      if (millis() - warnTimer > 1000) { 
         warnTimer = millis();
         if (!linkConnected) {
-            if (active_link_type == 1 && WiFi.status() != WL_CONNECTED) LogScreenPrintln("No Link", "WiFi Disconnected");
-            else if (usingWiFi) LogScreenPrintln("No Link", WiFi.localIP().toString());
+            if (usingWiFi && WiFi.status() != WL_CONNECTED) LogScreenPrintln("No WiFi", "Searching...");
+            else if (usingWiFi) LogScreenPrintln("No Link", diagLine.length() ? diagLine : shortText(connectedSsid, 21));
             else LogScreenPrintln("No Link", "ESP-NOW");
         }
         else if (droneSats < MIN_SATS) LogScreenPrintln("Drone: " + String(droneSats) + "/" + String(MIN_SATS)); 

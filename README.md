@@ -14,6 +14,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 
 ## ✨ Key Features
 * **100% Wireless Data Link:** Reads native CRSF telemetry over ESP-NOW or Wi-Fi UDP (Backpack 1.5.7+), or MAVLink (v1 or v2) over Wi-Fi UDP. No extra hardware required on the drone/plane.
+* **Two Saved WiFi Networks:** Store your radio's backpack *and* a MAVLink WiFi bridge (e.g. DroneBridge). At boot the tracker scans and joins whichever is on the air, or falls back to ESP-NOW, and the screen always shows which link it's using.
 * **Checksummed Telemetry:** Every CRSF and MAVLink position packet is CRC-checked before it is used, so a corrupted packet can never yank the antennas to a bogus position.
 * **Standalone Web UI:** Configure your network, servo limits, and hardware toggles directly from your phone. No Arduino IDE or C++ editing required.
 * **The "Gatekeeper" Safety:** Refuses to calibrate until both the ground station and the aircraft have a rock-solid 8+ satellite 3D lock.
@@ -111,7 +112,8 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 2. Connect using the password: **`anttracker`**
 3. Open a web browser and navigate to `192.168.4.1`.
 4. Fill out the web form:
-   * **Telemetry Mode:** Choose ESP-NOW (CRSF) for a fast-booting direct link, WiFi UDP to receive telemetry over your backpack's WiFi (MAVLink, or CRSF with Backpack 1.5.7+, detected automatically), or **Auto-Detect**, which tries the WiFi network for 12 seconds at boot and falls back to ESP-NOW if it can't connect. The form will dynamically hide inputs you don't need!
+   * **Telemetry Mode:** Choose ESP-NOW (CRSF) for a fast-booting direct link, WiFi UDP to receive telemetry over your backpack's WiFi (MAVLink, or CRSF with Backpack 1.5.7+, detected automatically), or **Auto-Detect**, which scans for your saved WiFi networks at boot and falls back to ESP-NOW if none of them are on the air. The form will dynamically hide inputs you don't need!
+   * **WiFi Networks:** You can save **two** networks, e.g. Network 1 = your radio's backpack (`ExpressLRS TX Backpack XXXXXX`) and Network 2 = a DroneBridge / mLRS WiFi bridge. At boot the tracker scans and joins whichever one is on the air (Network 1 wins if both are). The joined network's name is shown on the screen at boot and on the tracking screen, so you always know which link it's using.
    * **Servo Tuning:** Enter your exact servo PWM centers and limits (use the servo tester to find them):
      * **Pan Center / Min / Max:** Min and Max are the PWM values at the two ends of the servo's full travel; together with *Total Servo Travel* they set the degrees-per-microsecond scale.
      * **Tilt Horizon PWM:** antennas perfectly level (0°).
@@ -126,11 +128,17 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 1. **CRSF Users:** Ensure your TX Backpack is flashed with your binding phrase. In your model setup, turn **Telemetry ON**. Run the ELRS Lua Script and ensure the Backpack is enabled. Then pick how the backpack sends telemetry (ELRS Lua → **Backpack** → **Telemetry**):
    * **ESPNOW:** set the tracker to *ESP-NOW / CRSF Only*. No WiFi setup needed.
    * **WiFi** (Backpack firmware **1.5.7 or newer**): the backpack broadcasts the same CRSF telemetry over WiFi UDP. Set the tracker to *WiFi UDP Only* (or Auto-Detect), enter the backpack's WiFi network (its own AP is `ExpressLRS TX Backpack XXXXXX`, password `expresslrs`, unless you set home/hotspot credentials when flashing) and port `14550`. In this mode the backpack does **not** send ESP-NOW, so the tracker must be on WiFi.
+   * **Tip, switching per aircraft:** set the tracker to **Auto-Detect** with the backpack as Network 1. When the backpack's Telemetry is set to *WiFi* (e.g. MAVLink over ELRS), its network appears and the tracker joins it. Set it back to *ESPNOW* and the network disappears, so the tracker falls back to ESP-NOW automatically. The backpack Telemetry setting is radio-wide (not per model), so change it in the ELRS Lua script before flying a different aircraft.
 2. **ArduPilot Users (Crucial Fix):** If you use ArduPilot and are using ESP-NOW/CRSF, you **must disable CRSF Passthrough** (Bit 8 / Value 256 in `RC_OPTIONS`). Passthrough bundles telemetry into a custom format the tracker cannot read. Disabling it restores the standard CRSF GPS packets the tracker needs.
 3. **MAVLink / Wi-Fi Users (Read Carefully!):** First, follow the official [ExpressLRS MAVLink documentation](https://www.expresslrs.org/software/mavlink/) to set up your backpack correctly. 
    * ⚠️ **WARNING:** Do *not* try to manually turn on "Backpack Wi-Fi" from your radio's ELRS Lua script when trying to fly. Doing this forces the backpack into firmware-update mode and instantly breaks the telemetry relay. 
    * **Testing Tip:** Before trying to connect the antenna tracker, connect your laptop to your backpack's Wi-Fi network and open Mission Planner. If you can get UDP telemetry on your laptop, the tracker will work flawlessly. 
    * **What the tracker reads:** `GLOBAL_POSITION_INT` (position) and `GPS_RAW_INT` (fix type and satellite count). Both are in ArduPilot's default telemetry streams. If your flight controller doesn't send `GPS_RAW_INT`, the tracker still works but can't check the aircraft's satellite count (the screen will show 15 as a placeholder).
+4. **Separate MAVLink radio (mLRS, SiK, etc.) with a WiFi bridge such as DroneBridge:** add the bridge's WiFi as Network 2 and use WiFi UDP Only or Auto-Detect, port `14550`. The tracker and your laptop/Mission Planner can both be connected to the bridge at the same time; no forwarding through the laptop is needed. If the aircraft also has an ELRS receiver, ESP-NOW via the ELRS backpack works too and keeps the tracker independent of the bridge.
+   * **How the tracker registers itself:** DroneBridge only sends telemetry to devices that have sent it something. On MAVLink links the tracker sends a standard MAVLink heartbeat once a second (as an antenna tracker, system ID `252`), just like a ground station, so it's registered automatically. It uses system ID 252 rather than 255, so it never affects ArduPilot's GCS failsafe. The heartbeat is not sent on the ELRS backpack's CRSF-over-WiFi.
+   * **Recommended DroneBridge settings:** *Wi-Fi Access Point Mode*; change the default password (anyone who knows it could join and send commands to your aircraft); **UART serial protocol: Transparent** (in *MAVLink* mode DroneBridge adds itself as a separate device and Mission Planner may connect to it instead of your flight controller); **"Disable radio when autopilot is armed" OFF** (otherwise the tracker and Mission Planner lose telemetry at takeoff); UART baud must match your radio's serial port (e.g. mLRS *Tx Ser Baudrate*).
+   * **Serial speeds must match on each end:** ground radio ↔ bridge (e.g. mLRS *Tx Ser Baudrate* = DroneBridge *UART baud*), and air radio ↔ flight controller (e.g. mLRS *Rx Ser Baudrate* = ArduPilot `SERIALx_BAUD`). If the bridge's "received bytes" counter stays at 0, check these and the TX/RX wiring.
+   * **Telemetry rates:** the tracker aims each time a position message arrives. On slow links (e.g. mLRS 31 Hz) set ArduPilot's `SRx_POSITION` ≥ 2 and `SRx_EXT_STAT` ≥ 1 for that serial port, so tracking doesn't depend on Mission Planner being connected.
 
 ---
 
@@ -195,8 +203,15 @@ If the firmware flashed successfully but the screen is dead, your OLED likely us
 <details>
 <summary><b>📶 Troubleshooting: "No Link" (WiFi / MAVLink)</b></summary>
 
-* "WiFi Disconnected" means the tracker can't join the backpack's network: check the SSID/password. In WiFi-only mode the tracker keeps retrying in the background, so you can power the radio on after the tracker.
-* If WiFi connects (the screen shows an IP address) but there's still no link, check the UDP port (usually 14550) and confirm Mission Planner on a laptop receives telemetry from the same backpack.
+* "No WiFi / Searching..." means neither saved network is visible or the password is wrong: check the SSID spelling (it's case-sensitive) and password. The network must broadcast its name (hidden SSIDs aren't found by the scan). In WiFi-only mode the tracker rescans every 15 seconds, so you can power the radio or bridge on after the tracker.
+* If WiFi is connected but there's still "No Link", the second line of the screen shows a live reception summary, e.g. `P412 ok96 last3s`:
+  * **P** = WiFi packets received since boot, **ok** = valid position/GPS messages decoded since boot, **last** = seconds since the last packet (`-` = never).
+  * **P stays at 0:** nothing is being sent to the tracker. Check the UDP port (usually 14550), and confirm Mission Planner on a laptop receives telemetry from the same backpack/bridge.
+  * **P grows but ok stays at 0:** packets arrive but don't contain the aircraft's position. Check the telemetry rates (`SRx_POSITION`, `SRx_EXT_STAT`) and, for ArduPilot over CRSF, the passthrough note in Step 4.
+  * **`last` keeps jumping to several seconds:** telemetry is arriving in bursts; raise the position telemetry rate.
+  * With the tracker plugged into USB, the same statistics are printed every second in the Arduino Serial Monitor (115200 baud).
+* Aircraft satellite count stuck at exactly **15** on MAVLink: position is arriving but `GPS_RAW_INT` isn't; raise `SRx_EXT_STAT` to 1 Hz or more.
+* Joined the wrong network? If both saved networks are on the air, Network 1 always wins. Turn the other one off, or swap them in the Config page.
 </details>
 
 <details>
