@@ -15,6 +15,8 @@
       - Config mode now needs the button held for 1.5s at power-on (stray taps won't enter it)
       - Two saved WiFi networks; boot scan joins whichever is on the air; screen shows the SSID
       - ESP-NOW: hold last channel 15s after a dropout, then scan slowly (fast hopping could twitch servos)
+      - Tilt uses the aircraft's own baro/relative altitude when available (MAVLink relative_alt,
+        CRSF 0x09 baro frame), GPS difference as fallback; selectable in the config page
       - Servos rest after 5 min without telemetry and resume automatically at the same position
       - UDP: read whole datagrams (large DroneBridge packets used to stall reception) and send a
         1Hz MAVLink heartbeat so bridges like DroneBridge register the tracker
@@ -73,6 +75,7 @@
   #define CRSF_FRAMETYPE_GPS 0x02
 #endif
 #define CRSF_GPS_FRAME_LEN 0x11  // CRSF length byte for a GPS frame: type(1) + payload(15) + crc(1)
+#define CRSF_FRAMETYPE_BARO_ALT 0x09
 
 // MAVLink message IDs and their CRC_EXTRA seeds (from the MAVLink common.xml definitions)
 #define MAVLINK_MSG_GPS_RAW_INT          24
@@ -100,6 +103,7 @@ uint8_t active_mac[6];
 bool active_use_compass;
 bool active_use_trim_knob;
 bool active_reverse_pan;
+int active_alt_src = 0;   // 0 = Auto (aircraft relative/baro altitude, GPS fallback), 1 = GPS only
 
 int active_pan_center;
 int active_tilt_horizon;
@@ -116,6 +120,8 @@ volatile double droneLat = 0;
 volatile double droneLon = 0;
 volatile float droneAlt = 0;
 volatile int droneSats = 0;
+volatile float droneRelAlt = 0;              // Aircraft's own height above launch/home (baro-based), meters
+volatile unsigned long lastRelAltTime = 0;   // When droneRelAlt was last updated (0 = never)
 volatile bool linkConnected = false;
 volatile unsigned long lastPacketTime = 0;   // Written from the ESP-NOW callback (WiFi task)
 unsigned long lastGpsRawTime = 0;            // Last MAVLink GPS_RAW_INT (real satellite count)
@@ -179,6 +185,8 @@ struct Vector hc_vector  = { 90, 0, 0};
 void pointServos(uint16_t az, uint16_t el);
 void getAzEl(struct Location &home, struct Location &current);
 float getDist(struct Location &a, struct Location &b);
+bool relAltActive();
+float heightAboveTracker(const struct Location &c);
 void StartEspNow();
 bool ConnectSavedWiFi(unsigned long timeoutMs);
 void ServiceWiFiReconnect();
@@ -227,9 +235,8 @@ void UpdateDisplay(int targetAz, int trimVal) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
-    float rawDiff = cur.alt - hom.alt;
-    float trueDiff = rawDiff - altOffset; 
-    String mode = "REL"; 
+    float trueDiff = heightAboveTracker(cur);
+    String mode = relAltActive() ? "REL" : "GPS";   // REL = aircraft's own baro/relative altitude
     
     display.print("Alt:"); display.print(trueDiff, 0);
     display.print("m ["); display.print(mode); display.println("]");
@@ -346,6 +353,13 @@ const char* htmlTemplate = R"rawliteral(
       </select>
     </div>
   </div>
+
+  <label>Altitude Source</label>
+  <span class="help">Auto: use the aircraft's own height-above-launch (barometer) when it sends one, which is far more accurate than GPS altitude; falls back to GPS. Choose GPS only if you launch well above or below the tracker (e.g. hilltop).</span>
+  <select name="alt_src">
+    <option value="0" V_ALT0>Auto (aircraft barometer, GPS fallback)</option>
+    <option value="1" V_ALT1>GPS only</option>
+  </select>
 
   <h2>Servo Tuning (Pan Axis)</h2>
   <div class="row">
@@ -523,6 +537,9 @@ void StartWebConfig() {
         if (active_use_trim_knob) { html.replace("V_TRIM1", "selected"); html.replace("V_TRIM0", ""); } 
         else { html.replace("V_TRIM1", ""); html.replace("V_TRIM0", "selected"); }
 
+        html.replace("V_ALT0", active_alt_src == 0 ? "selected" : "");
+        html.replace("V_ALT1", active_alt_src == 1 ? "selected" : "");
+
         server.send(200, "text/html", html);
     });
 
@@ -558,6 +575,7 @@ void StartWebConfig() {
         preferences.putBool("rev_pan", server.arg("rev_pan").toInt() == 1);
         preferences.putBool("use_comp", server.arg("use_comp").toInt() == 1);
         preferences.putBool("use_trim", server.arg("use_trim").toInt() == 1);
+        preferences.putUInt("alt_src", server.arg("alt_src").toInt() == 1 ? 1 : 0);
 
         preferences.putBool("configured", true); 
         preferences.end();
@@ -623,13 +641,7 @@ uint8_t crsfCrc8(const uint8_t *p, uint8_t len) {
   return crc;
 }
 
-void parseCRSF(const uint8_t *data, int data_len) {
-  // i = index of the type byte. Need len byte before it and 15 payload + 1 crc after it.
-  for (int i = 1; i + 16 < data_len; i++) {
-    if (data[i] != CRSF_FRAMETYPE_GPS || data[i - 1] != CRSF_GPS_FRAME_LEN) continue;
-    if (crsfCrc8(&data[i], 16) != data[i + 16]) continue;   // CRC covers type + payload
-
-    const uint8_t *p = &data[i + 1];   // Payload (all fields big-endian)
+void handleCrsfGps(const uint8_t *p) {   // p = payload (all fields big-endian)
     int32_t lat = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
     int32_t lon = (int32_t)(((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | (uint32_t)p[7]);
     // p[8..9] ground speed, p[10..11] heading
@@ -642,7 +654,36 @@ void parseCRSF(const uint8_t *data, int data_len) {
     droneAlt = (float)altitudeRaw - 1000.0f;
     droneSats = sats;
     portEXIT_CRITICAL(&telemetryMux);
-    return;
+}
+
+// CRSF 0x09 barometric altitude (sent by Betaflight/INAV when the FC has a baro): height
+// relative to where the FC zeroed its baro (arming). Packed: bit15 clear = decimeters + 10000,
+// bit15 set = whole meters.
+void handleCrsfBaroAlt(const uint8_t *p) {
+    uint16_t packed = ((uint16_t)p[0] << 8) | p[1];
+    float altM = (packed & 0x8000) ? (float)(packed & 0x7FFF) : ((int32_t)packed - 10000) / 10.0f;
+    portENTER_CRITICAL(&telemetryMux);
+    droneRelAlt = altM;
+    lastRelAltTime = millis();
+    portEXIT_CRITICAL(&telemetryMux);
+}
+
+void parseCRSF(const uint8_t *data, int data_len) {
+  // Walk the packet looking for [len][type][payload...][crc] frames we use. The CRC (over
+  // type + payload) must match, so random bytes inside other frames are never decoded.
+  for (int i = 1; i < data_len; i++) {
+    uint8_t len = data[i - 1];          // CRSF length = type + payload + crc
+    uint8_t type = data[i];
+    bool isGps  = (type == CRSF_FRAMETYPE_GPS && len == CRSF_GPS_FRAME_LEN);
+    bool isBaro = (type == CRSF_FRAMETYPE_BARO_ALT && (len == 5 || len == 6));   // 3- or 4-byte payload
+    if (!isGps && !isBaro) continue;
+    int crcIdx = i + len - 1;
+    if (crcIdx >= data_len) continue;
+    if (crsfCrc8(&data[i], len - 1) != data[crcIdx]) continue;
+
+    if (isGps) handleCrsfGps(&data[i + 1]);
+    else handleCrsfBaroAlt(&data[i + 1]);
+    i = crcIdx;   // continue after this frame
   }
 }
 
@@ -682,7 +723,12 @@ void handleMavlinkMessage(uint32_t msgId, uint8_t *payload) {
         int32_t latInt = mavInt32(&payload[4]);
         int32_t lonInt = mavInt32(&payload[8]);
         int32_t altMm  = mavInt32(&payload[12]);
+        int32_t relMm  = mavInt32(&payload[16]);   // relative_alt: height above home (EKF, baro-based)
         if (latInt != 0 && lonInt != 0) {
+            portENTER_CRITICAL(&telemetryMux);
+            droneRelAlt = relMm / 1000.0f;
+            lastRelAltTime = millis();
+            portEXIT_CRITICAL(&telemetryMux);
             portENTER_CRITICAL(&telemetryMux);
             droneLat = (double)latInt / 10000000.0;
             droneLon = (double)lonInt / 10000000.0;
@@ -1171,6 +1217,7 @@ void setup() {
       active_reverse_pan = preferences.getBool("rev_pan", false);
       active_use_compass = preferences.getBool("use_comp", false);
       active_use_trim_knob = preferences.getBool("use_trim", false);
+      active_alt_src = preferences.getUInt("alt_src", 0);
   }
   preferences.end();
 
@@ -1348,7 +1395,7 @@ void loop() {
       cur.alt = droneAlt;
       portEXIT_CRITICAL(&telemetryMux);
       
-      cur.alt_ag = cur.alt - hom.alt - altOffset;   // Height above the calibrated ground level
+      cur.alt_ag = heightAboveTracker(cur);   // Height above the tracker (aircraft baro or GPS)
       gpsGood = true;       
   }
 
@@ -1448,6 +1495,28 @@ float getDist(struct Location &a, struct Location &b) {
   return 6371000.0 * c; 
 }
 
+// Is the aircraft's own height-above-launch (barometer/EKF) available and fresh?
+bool relAltActive() {
+  if (active_alt_src != 0) return false;   // GPS-only mode selected in the config page
+  portENTER_CRITICAL(&telemetryMux);
+  unsigned long t = lastRelAltTime;
+  portEXIT_CRITICAL(&telemetryMux);
+  return t != 0 && (millis() - t) < 3000;
+}
+
+// Aircraft height above the tracker, in meters.
+//  - Aircraft relative altitude (preferred): accurate to ~1m, assumes launch near tracker height.
+//  - Fallback: GPS altitude difference, corrected by the offset measured at calibration.
+float heightAboveTracker(const struct Location &c) {
+  if (relAltActive()) {
+    portENTER_CRITICAL(&telemetryMux);
+    float h = droneRelAlt;
+    portEXIT_CRITICAL(&telemetryMux);
+    return h;
+  }
+  return c.alt - hom.alt - altOffset;
+}
+
 void getAzEl(struct Location &hom, struct Location &cur) {
   double dLon = (cur.lon - hom.lon) * PI / 180.0;
   double lat1 = hom.lat * PI / 180.0;
@@ -1464,8 +1533,7 @@ void getAzEl(struct Location &hom, struct Location &cur) {
   double c = 2 * atan2(sqrt(a), sqrt(1-a));
   hc_vector.dist = 6371000 * c; 
 
-  float rawDiff = cur.alt - hom.alt;
-  float diff = rawDiff - altOffset;
+  float diff = heightAboveTracker(cur);
   if (diff < 0) diff = 0; 
   hc_vector.el = atan2(diff, hc_vector.dist) * 180.0 / PI;
 }

@@ -14,6 +14,7 @@ Your ExpressLRS transmitter **MUST have a hardware "Backpack" chip installed**. 
 
 ## ✨ Key Features
 * **100% Wireless Data Link:** Reads native CRSF telemetry over ESP-NOW or Wi-Fi UDP (Backpack 1.5.7+), or MAVLink (v1 or v2) over Wi-Fi UDP. No extra hardware required on the drone/plane.
+* **Accurate Tilt from the Aircraft's Barometer:** Uses the aircraft's own height-above-launch (barometer-based) when its telemetry includes it, which is far steadier than GPS altitude; falls back to GPS automatically.
 * **Two Saved WiFi Networks:** Store your radio's backpack *and* a MAVLink WiFi bridge (e.g. DroneBridge). At boot the tracker scans and joins whichever is on the air, or falls back to ESP-NOW, and the screen always shows which link it's using.
 * **Checksummed Telemetry:** Every CRSF and MAVLink position packet is CRC-checked before it is used, so a corrupted packet can never yank the antennas to a bogus position.
 * **Standalone Web UI:** Configure your network, servo limits, and hardware toggles directly from your phone. No Arduino IDE or C++ editing required.
@@ -120,6 +121,9 @@ On its very first boot, the tracker will realize it has no saved settings and wi
      * **Tilt Up PWM (90°):** antennas pointing straight up. This sets the tilt scale, so measure it rather than guessing. If straight-up is a *higher* number than horizon, that's fine, the tilt simply runs in reverse.
      * **Tilt Down Limit PWM:** the physical limit on the below-horizon side. The servo is never driven past Up or Down.
    * **Hardware Toggles:** Tell the code if you installed the optional BNO085 compass or physical Trim Knob.
+   * **Altitude Source:**
+     * **Auto (default):** tilt uses the aircraft's own height above its launch point, from its barometer, whenever the telemetry includes it: MAVLink `GLOBAL_POSITION_INT.relative_alt`, or the CRSF barometric-altitude frame sent by Betaflight/INAV when the flight controller has a baro. It's accurate to about a meter and doesn't wander like GPS altitude. If it isn't available, the tracker uses the GPS altitude difference instead.
+     * **GPS only:** choose this if you launch well above or below the tracker (e.g. hilltop launch, tracker in the valley). The aircraft's barometer measures height above *its launch point*, so Auto assumes you launch roughly level with the tracker.
 5. Click **Save & Reboot**. The ESP32 will save your settings permanently.
 
 *(Note: If you ever change hardware or want to update your limits, hold down the physical Home/Reset button while powering on the tracker and keep holding for about 2 seconds to force it back into Config Mode!)*
@@ -146,6 +150,7 @@ On its very first boot, the tracker will realize it has no saved settings and wi
 
 1. **Boot Sequence:** Power up the ground station. The tracker waits for its local GPS to hit 8 satellites. Power up your aircraft; the tracker LED will blink until it receives the drone's telemetry confirming it also has 8 satellites.
 2. **Calibration (Required before every flight):** Walk your powered aircraft 20-30m directly in front of the tracker and set it **on the ground**. Physically rotate the tripod so the antennas point dead-center at the plane. When the screen says "Ready," hold the calibrate button for 1 second.
+   * The tracking screen's `Alt:` line shows `[REL]` when tilt is using the aircraft's barometer altitude, or `[GPS]` when it's using GPS. In `[GPS]` mode, give both GPS units 2–3 minutes after their fix (and an open view of the sky, away from walls) before calibrating, as GPS altitude takes a while to settle.
    * Calibration records "the tracker is pointing straight at the aircraft right now" and "the aircraft is at ground level right now", so both the direction and the ground placement matter. This is the same with or without the compass.
    * **What the compass adds:** if the tripod gets bumped or rotated *after* calibration, the BNO085 detects the rotation and the tracker corrects for it automatically. Without a compass, a bumped tripod means recalibrating.
    * If the compass is enabled but failed to start (screen showed "Compass FAIL" at boot), calibration automatically falls back to visual mode.
