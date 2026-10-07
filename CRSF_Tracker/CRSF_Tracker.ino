@@ -14,6 +14,8 @@
       - 5 quick taps on the button clears the saved failsafe calibration, even during boot
       - Config mode now needs the button held for 1.5s at power-on (stray taps won't enter it)
       - Two saved WiFi networks; boot scan joins whichever is on the air; screen shows the SSID
+      - ESP-NOW: hold last channel 15s after a dropout, then scan slowly (fast hopping could twitch servos)
+      - Servos rest after 5 min without telemetry and resume automatically at the same position
       - UDP: read whole datagrams (large DroneBridge packets used to stall reception) and send a
         1Hz MAVLink heartbeat so bridges like DroneBridge register the tracker
       - GPS: UBX-only + autoPVT so the main loop no longer blocks on every GPS read
@@ -63,6 +65,9 @@
 #define MIN_TRACKING_ALT 5     // Meters above the calibrated ground level
 #define SERVO_SPEED 0.3        // Smoothing factor per 20ms step (lower = smoother/slower, e.g. 0.1)
 #define MAX_TRIM_ANGLE 20
+#define SERVO_REST_MS   300000UL  // Stop driving the servos after 5 min with no telemetry (resume automatically)
+#define ESPNOW_HOLD_MS  15000UL   // After an ESP-NOW dropout, stay on the last good channel this long
+#define ESPNOW_HOP_MS   250UL     // ...then scan the other WiFi channels one at a time at this pace
 
 #ifndef CRSF_FRAMETYPE_GPS
   #define CRSF_FRAMETYPE_GPS 0x02
@@ -186,6 +191,7 @@ void ServiceTheStatusLed();
 void ReadLocalGPS(); 
 void ReadCompass();
 void WakeServos();
+void SleepServos();
 
 // =======================================================================================
 // LOGGING & DISPLAY
@@ -568,18 +574,34 @@ void StartWebConfig() {
 // =======================================================================================
 // HARDWARE CONTROL
 // =======================================================================================
+bool servoPosKnown = false;   // false until the servos have been driven at least once
+
 void WakeServos() {
     if (!servosAwake) {
-        // ESP32Servo ignores writes made before attach(), so attach first, then command
-        // center/horizon. min()/max() keep the limits valid for reversed servos.
+        // ESP32Servo ignores writes made before attach(), so attach first, then command a
+        // position. min()/max() keep the limits valid for reversed servos.
         azServo.attach(azPWM_Pin, min(active_min_az_pwm, active_max_az_pwm), max(active_min_az_pwm, active_max_az_pwm));
         elServo.attach(elPWM_Pin, min(active_min_el_pwm, active_max_el_pwm), max(active_min_el_pwm, active_max_el_pwm));
-        azServo.writeMicroseconds(active_pan_center);
-        elServo.writeMicroseconds(active_tilt_horizon);
-        // Seed the smoothing filter from center so the first move is eased, not a jump
-        currentPanPWM = active_pan_center;
-        currentTiltPWM = active_tilt_horizon;
+        if (!servoPosKnown) {
+            // First wake: start from center/horizon so the first move is eased, not a jump
+            currentPanPWM = active_pan_center;
+            currentTiltPWM = active_tilt_horizon;
+            servoPosKnown = true;
+        }
+        // After a rest, resume exactly where the antennas were left
+        azServo.writeMicroseconds((int)currentPanPWM);
+        elServo.writeMicroseconds((int)currentTiltPWM);
         servosAwake = true;
+    }
+}
+
+// Stop sending servo pulses (no buzzing/twitching/battery drain while the aircraft is off).
+// The pull-down resistors keep the signal lines quiet. WakeServos() resumes from the same spot.
+void SleepServos() {
+    if (servosAwake) {
+        azServo.detach();
+        elServo.detach();
+        servosAwake = false;
     }
 }
 
@@ -1303,10 +1325,17 @@ void loop() {
       if ((long)(millis() - lastPacketTime) > 2000) { channelLocked = false; linkConnected = false; }
   } else {
       if (sinceLastPacket > 2000) {
-        channelLocked = false; linkConnected = false; 
-        currentChannel++; if (currentChannel > 13) currentChannel = 1;
-        esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-        delay(10); 
+        channelLocked = false; linkConnected = false;
+        // Dropouts usually come back on the same channel, so hold the last good channel for a
+        // while, then scan the others slowly. (Hopping every loop meant constant radio activity,
+        // which could put noise on the servo lines and make them twitch.)
+        static unsigned long lastHop = millis();   // first visit: listen on the start channel a moment
+        bool everConnected = (lastPacketTime != 0);
+        if ((!everConnected || (unsigned long)sinceLastPacket > ESPNOW_HOLD_MS) && millis() - lastHop > ESPNOW_HOP_MS) {
+            lastHop = millis();
+            currentChannel = (currentChannel % 13) + 1;
+            esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+        }
       }
   }
 
@@ -1324,6 +1353,7 @@ void loop() {
   }
 
   if (homeEstablished && calibrationDone && linkConnected) {
+      WakeServos();   // No-op if already awake; resumes after a long link loss
       getAzEl(hom, cur); 
       
       float targetAzBase = hc_vector.az - trackerHeading - panOffset;
@@ -1366,10 +1396,15 @@ void loop() {
       }
   } 
   else if (homeEstablished && calibrationDone && !linkConnected) {
+     // No telemetry for 5 minutes (aircraft unplugged / packed away): rest the servos.
+     // They wake automatically, at the same position, as soon as telemetry returns.
+     bool resting = (long)(millis() - lastPacketTime) > (long)SERVO_REST_MS;
+     if (resting) SleepServos();
      static unsigned long warnTimer = 0;
      if (millis() - warnTimer > 1000) {
         warnTimer = millis();
-        if (usingWiFi) LogScreenPrintln("LINK LOST", WiFi.status() == WL_CONNECTED ? (diagLine.length() ? diagLine : shortText(connectedSsid, 21)) : String("WiFi searching..."));
+        if (resting) LogScreenPrintln("LINK LOST", "Servos resting");
+        else if (usingWiFi) LogScreenPrintln("LINK LOST", WiFi.status() == WL_CONNECTED ? (diagLine.length() ? diagLine : shortText(connectedSsid, 21)) : String("WiFi searching..."));
         else LogScreenPrintln("LINK LOST", "ESP-NOW");
      }
   }

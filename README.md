@@ -150,6 +150,7 @@ On its very first boot, the tracker will realize it has no saved settings and wi
    * **What the compass adds:** if the tripod gets bumped or rotated *after* calibration, the BNO085 detects the rotation and the tracker corrects for it automatically. Without a compass, a bumped tripod means recalibrating.
    * If the compass is enabled but failed to start (screen showed "Compass FAIL" at boot), calibration automatically falls back to visual mode.
 3. **Flight:** The servos hold their position until the aircraft is more than `MIN_TRACKING_DIST` (default 5 meters) away or `MIN_TRACKING_ALT` (default 5 meters) above the calibration point. Then smooth tracking begins. (Closer than ~5m, normal GPS wander makes the bearing to the aircraft jump around.)
+   * **Link lost:** the antennas hold their last position and tracking resumes automatically when telemetry returns. After **5 minutes** with no telemetry (e.g. aircraft unplugged and packed away) the screen shows "Servos resting" and the tracker stops driving the servos (no buzzing or battery drain); they wake at the same position as soon as telemetry is back. No reboot needed.
    * **Blind spot:** the pan axis can't spin all the way around. With a 270° servo, the 90° behind the tracker is out of reach; if the aircraft crosses through it, the pan swings across to the other side. Point the tracker at the center of your flying area to keep the aircraft out of that zone.
 
 ---
