@@ -1,0 +1,5 @@
+# Arduino IDE build output (attach the .bin files to GitHub Releases instead)
+CRSF_Tracker/build/
+
+# Editor folders
+.vscode/
